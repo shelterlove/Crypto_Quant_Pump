@@ -97,6 +97,7 @@ class PumpCandidate:
     volume_ratio: float
     quote_volume_24h: float
     tier: str = "B"  # v2.0: "A" | "B" signal quality
+    ema20_dev_rank_2160h: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -606,7 +607,7 @@ class ResearchBacktester:
         columns = [
             "close", "volume", "ret_24h", "ret_6h", "ret_72h", "above_ma20",
             "qv_6h_sum", "qv_24h_sum", "qv_30_avg", "wick_ratio",
-            "new_12h_high", "regime_vol_expansion", "atr14",
+            "new_12h_high", "regime_vol_expansion", "atr14", "ema20_dev_rank_2160h",
         ]
         cache: dict[str, dict[str, np.ndarray]] = {}
         for symbol, frame in candles_1h.items():
@@ -683,6 +684,7 @@ class ResearchBacktester:
                     "new_12h_high": bool(values["new_12h_high"][idx]),
                     "regime_vol_expansion": bool(values["regime_vol_expansion"][idx]),
                     "atr": float(values["atr14"][idx]),
+                    "ema20_dev_rank_2160h": float(values["ema20_dev_rank_2160h"][idx]),
                 }
             )
         return pd.DataFrame(rows)
@@ -1342,6 +1344,10 @@ class ResearchBacktester:
             frame["ret_6h"] = close / close.shift(6) - 1
             # Trend helpers
             frame["ma20"] = close.rolling(trend_cfg.ma_short_period).mean()
+            frame["ema20"] = close.ewm(span=20, adjust=False).mean()
+            ema20_dev = close / frame["ema20"].replace(0, np.nan) - 1
+            frame["ema20_dev"] = ema20_dev
+            frame["ema20_dev_rank_2160h"] = ema20_dev.rolling(2160, min_periods=50).rank(pct=True).fillna(0.0)
             # ATR
             tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
             frame["atr14"] = tr.rolling(14).mean()
@@ -1838,10 +1844,19 @@ class ResearchBacktester:
             score = ret_24h * 0.45 + ret_72h * 0.35 + ret_6h * 0.10 + min(volume_ratio / 5.0, 1.0) * 0.10
             tier = "A" if (regime == "WARM" and (early or warm_early_ok) and 0.45 <= ret_72h <= 0.86 and volume_ratio <= 15) else "B"
             sig_type = "early_confirmed" if (early and confirmed_sig) else ("early" if early else "confirmed")
+            ema20_dev_rank_2160h = float(row.ema20_dev_rank_2160h)
+            if (
+                cfg.bad_b_ema_vr_risk_enabled
+                and tier == "B"
+                and sig_type == "early"
+                and ema20_dev_rank_2160h >= cfg.bad_b_ema_rank_min
+                and volume_ratio > cfg.bad_b_volume_ratio_min
+            ):
+                risk_multiplier *= cfg.bad_b_risk_multiplier
             reason = f"pump_{regime}_{tier}_{sig_type}"
             candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
                 reason=reason, ret_6h=ret_6h, ret_24h=ret_24h, ret_72h=ret_72h, volume_ratio=volume_ratio,
-                quote_volume_24h=quote_volume_24h, tier=tier))
+                quote_volume_24h=quote_volume_24h, tier=tier, ema20_dev_rank_2160h=ema20_dev_rank_2160h))
         return sorted(candidates, key=lambda item: item.score, reverse=True)
 
     def _enter_pump_positions(
@@ -1953,6 +1968,14 @@ class ResearchBacktester:
                             "stop_price": stop_price,
                             "atr": candidate.atr,
                             "risk_multiplier": candidate.risk_multiplier,
+                            "ema20_dev_rank_2160h": candidate.ema20_dev_rank_2160h,
+                            "bad_b_ema_vr_risk_reduced": (
+                                candidate.tier == "B"
+                                and "early" in candidate.reason
+                                and "confirmed" not in candidate.reason
+                                and candidate.ema20_dev_rank_2160h >= cfg.bad_b_ema_rank_min
+                                and candidate.volume_ratio > cfg.bad_b_volume_ratio_min
+                            ),
                             "score": candidate.score,
                             "ret_6h": candidate.ret_6h,
                             "ret_24h": candidate.ret_24h,

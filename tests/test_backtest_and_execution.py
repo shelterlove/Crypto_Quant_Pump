@@ -273,6 +273,39 @@ def test_pump_candidates_detect_fast_volume_backed_move() -> None:
     assert candidates[0].reason in {"pump_HOT_B_early", "pump_HOT_B_confirmed", "pump_HOT_B_early_confirmed"}
 
 
+def test_bad_b_ema_vr_candidate_gets_reduced_risk() -> None:
+    cfg = load_config("configs/mvp.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
+    backtester = ResearchBacktester(cfg)
+    backtester._pump_regime = "HOT"
+    snapshot = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA/USDT",
+                "history": 100,
+                "price": 1.0,
+                "ret_24h": 0.25,
+                "ret_72h": 0.20,
+                "ret_6h": 0.12,
+                "above_ma20": True,
+                "qv_6h": 31_000_000,
+                "qv_24h": 50_000_000,
+                "qv_30_avg": 1_000_000,
+                "wick_ratio": 0.1,
+                "new_12h_high": False,
+                "regime_vol_expansion": True,
+                "atr": 0.05,
+                "ema20_dev_rank_2160h": 0.99,
+            }
+        ]
+    )
+
+    candidates = backtester._pump_candidates_from_snapshot(snapshot, Portfolio(cash=100_000), 100_000, datetime(2024, 1, 1, tzinfo=UTC))
+
+    assert len(candidates) == 1
+    assert candidates[0].reason == "pump_HOT_B_early"
+    assert candidates[0].risk_multiplier == pytest.approx(0.5)
+
+
 def test_pump_stop_trails_after_large_mfe() -> None:
     cfg = load_config("configs/mvp.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
     backtester = ResearchBacktester(cfg)
