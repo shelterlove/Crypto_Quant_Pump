@@ -245,7 +245,7 @@ def test_pump_candidates_detect_fast_volume_backed_move() -> None:
     cfg = load_config("configs/mvp.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
     backtester = ResearchBacktester(cfg)
     index = pd.date_range("2024-01-01", periods=80, freq="h", tz="UTC")
-    close = pd.Series([100.0] * 50 + list(pd.Series(range(101, 131), dtype=float) * 1.5))
+    close = pd.Series([100.0] * 50 + [150.0] * 20 + list(pd.Series(range(160, 210, 5), dtype=float)))
     frame = pd.DataFrame(
         {
             "open_time": index,
@@ -263,14 +263,13 @@ def test_pump_candidates_detect_fast_volume_backed_move() -> None:
     candidates = backtester._pump_candidates(
         {"AAA/USDT": frame},
         Portfolio(cash=100_000),
-        MarketState("risk_on"),
         100_000,
         index[-1].to_pydatetime(),
     )
 
     assert candidates
     assert candidates[0].symbol == "AAA/USDT"
-    assert candidates[0].reason in {"pump_early", "pump_confirmed", "pump_early_confirmed"}
+    assert candidates[0].reason in {"pump_HOT_B_early", "pump_HOT_B_confirmed", "pump_HOT_B_early_confirmed"}
 
 
 def test_pump_stop_trails_after_large_mfe() -> None:

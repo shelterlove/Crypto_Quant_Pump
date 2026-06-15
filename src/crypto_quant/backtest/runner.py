@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import os
 from pathlib import Path
+import time
 
 import numpy as np
 import pandas as pd
@@ -154,6 +156,7 @@ class ResearchBacktester:
     _pump_post_entry: list[dict[str, object]] = field(default_factory=list)  # post-entry price paths
     _pump_recent_exits: list[str] = field(default_factory=list)  # v20: adaptive risk tracking
     _candles_ref: dict[str, pd.DataFrame] = field(default_factory=dict)  # v2.5: full candles ref for enrichment
+    _snapshot_cache_1h: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
 
     def run_synthetic(self, session: Session | None = None) -> BacktestResult:
         run_id = self._create_run(session, "synthetic-mvp") if session is not None else None
@@ -233,21 +236,37 @@ class ResearchBacktester:
             self._pos_cache_4h = self._build_position_cache(candles_4h, timeline)
             # Pre-compute all factor columns once on full DataFrames
             self._precompute_indicators(candles_1h, candles_4h)
+            self._snapshot_cache_1h = self._build_snapshot_value_cache(candles_1h)
             portfolio = Portfolio(cash=self.config.backtest.initial_equity, initial_equity=self.config.backtest.initial_equity)
             broker = BacktestBroker(self.config.backtest.fee_bps, self._slippage_bps())
             equity_high = self.config.backtest.initial_equity
             engine = StrategyEngine(self.config)  # v1: stateful engine
             self._last_engine = engine
+            progress_every = int(os.environ.get("CQ_BACKTEST_PROGRESS_EVERY", "0") or 0)
+            progress_started = time.perf_counter()
+            progress_total = max(len(timeline) - 1, 1)
 
             for i, now in enumerate(timeline[:-1]):
+                if progress_every and (i == 0 or i % progress_every == 0):
+                    elapsed = time.perf_counter() - progress_started
+                    rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+                    remaining = (progress_total - i - 1) / rate if rate > 0 else 0.0
+                    print(
+                        f"[backtest] {i + 1}/{progress_total} "
+                        f"now={now.isoformat()} "
+                        f"positions={len(portfolio.positions)} orders={len(orders)} "
+                        f"regime={self._pump_regime} elapsed={elapsed / 60:.1f}m eta={remaining / 60:.1f}m",
+                        flush=True,
+                    )
                 next_time = timeline[i + 1]
                 portfolio.reset_daily_loss(now)
 
-                active_symbols = universe_map.get(monday_utc(now), [])
-                # Grace period: keep coins that were in the universe last week
-                prev_week = monday_utc(now) - timedelta(days=7)
-                prev_symbols = universe_map.get(prev_week, [])
-                active_symbols = sorted(set(active_symbols) | set(prev_symbols))
+                active_symbols = [] if self.config.pump_mode.enabled else universe_map.get(monday_utc(now), [])
+                if not self.config.pump_mode.enabled:
+                    # Grace period: keep coins that were in the universe last week
+                    prev_week = monday_utc(now) - timedelta(days=7)
+                    prev_symbols = universe_map.get(prev_week, [])
+                    active_symbols = sorted(set(active_symbols) | set(prev_symbols))
 
                 # Filter mega-cap and excluded coins from trading universe.
                 # BTC is still kept for market state monitoring via btc_symbol config.
@@ -260,7 +279,7 @@ class ResearchBacktester:
                 ]
                 # Momentum watchlist: extreme momentum coins bypass pool volume threshold.
                 # Scan ALL loaded candles, not just universe symbols.
-                all_spot = [s for s in candles_1h.keys() if s not in active_symbols
+                all_spot = [] if self.config.pump_mode.enabled else [s for s in candles_1h.keys() if s not in active_symbols
                            and s.split('/')[0].upper() not in mega_caps
                            and not any(kw in s.split('/')[0].upper() for kw in keywords)
                            and s != self.config.market_state.btc_symbol]
@@ -295,6 +314,8 @@ class ResearchBacktester:
                     current_4h = {}
 
                 pump_scan_1h: dict[str, pd.DataFrame] = {}
+                pump_snapshot = pd.DataFrame()
+                pump_prices_all: dict[str, float] = {}
                 if self.config.pump_mode.enabled:
                     pump_symbols = [
                         s for s in all_symbols
@@ -302,7 +323,8 @@ class ResearchBacktester:
                         and s.split("/")[0].upper() not in mega_caps
                         and not any(kw in s.split("/")[0].upper() for kw in keywords)
                     ]
-                    pump_scan_1h = self._slice(candles_1h, pump_symbols, now, cache=self._pos_cache_1h)
+                    pump_snapshot = self._pump_snapshot(candles_1h, pump_symbols, now)
+                    pump_prices_all = self._pump_latest_prices(candles_1h, pump_symbols, now)
 
                 # v2.5: fast path for pump-only — skip market breadth, keep fast_risk_valve
                 if self.config.pump_mode.enabled:
@@ -349,15 +371,15 @@ class ResearchBacktester:
                 # v2.5: detect pump regime from sliced candles, scan candidates if HOT/WARM
                 pump_candidates: list = []
                 pump_prices: dict[str, float] = {}
-                if self.config.pump_mode.enabled and pump_scan_1h:
+                if self.config.pump_mode.enabled and (not pump_snapshot.empty or pump_prices_all):
                     if now >= self._pump_cooldown_until:
                         if not hasattr(self, '_last_regime_check') or (now - self._last_regime_check).total_seconds() >= 14400:
-                            self._pump_regime = self._detect_pump_regime(pump_scan_1h)
+                            self._pump_regime = self._detect_pump_regime_snapshot(pump_snapshot)
                             self._last_regime_check = now
                         if self._pump_regime in ("HOT", "WARM"):
-                            pump_prices = self._last_prices(pump_scan_1h)
+                            pump_prices = pump_prices_all
                             pump_equity = portfolio.equity({**prices_all, **pump_prices})
-                            pump_candidates = self._pump_candidates(pump_scan_1h, portfolio, pump_equity, now)
+                            pump_candidates = self._pump_candidates_from_snapshot(pump_snapshot, portfolio, pump_equity, now)
                     self._enter_pump_positions(
                         session,
                         run_id,
@@ -574,6 +596,91 @@ class ResearchBacktester:
                 if 'atr14' in frame.columns:
                     row['atr'] = float(frame['atr14'].iloc[idx])
             rows.append(row)
+        return pd.DataFrame(rows)
+
+    def _build_snapshot_value_cache(self, candles_1h: dict[str, pd.DataFrame]) -> dict[str, dict[str, np.ndarray]]:
+        columns = [
+            "close", "volume", "ret_24h", "ret_6h", "ret_72h", "above_ma20",
+            "qv_6h_sum", "qv_24h_sum", "qv_30_avg", "wick_ratio",
+            "new_12h_high", "regime_vol_expansion", "atr14",
+        ]
+        cache: dict[str, dict[str, np.ndarray]] = {}
+        for symbol, frame in candles_1h.items():
+            if frame.empty or not set(columns).issubset(frame.columns):
+                continue
+            cache[symbol] = {column: frame[column].to_numpy(copy=False) for column in columns}
+        return cache
+
+    def _cached_position(self, symbol: str, end: datetime) -> int | None:
+        symbol_cache = self._pos_cache_1h.get(symbol)
+        if symbol_cache is None:
+            return None
+        return symbol_cache.get(pd.Timestamp(ensure_utc(end)))
+
+    def _pump_latest_prices(self, candles: dict[str, pd.DataFrame], symbols: list[str], end: datetime) -> dict[str, float]:
+        prices: dict[str, float] = {}
+        end_ts = pd.Timestamp(ensure_utc(end))
+        for symbol in symbols:
+            frame = candles.get(symbol)
+            if frame is None or frame.empty:
+                continue
+            pos = self._cached_position(symbol, end)
+            if pos is not None:
+                idx = int(pos) - 1
+            else:
+                try:
+                    idx = frame.index.get_loc(end_ts)
+                except KeyError:
+                    continue
+            if idx < 0:
+                continue
+            values = self._snapshot_cache_1h.get(symbol)
+            if values is not None:
+                prices[symbol] = float(values["close"][idx])
+            else:
+                prices[symbol] = float(frame["close"].iloc[idx])
+        return prices
+
+    def _pump_snapshot(self, candles: dict[str, pd.DataFrame], symbols: list[str], end: datetime) -> pd.DataFrame:
+        rows: list[dict[str, object]] = []
+        end_ts = pd.Timestamp(ensure_utc(end))
+        for symbol in symbols:
+            frame = candles.get(symbol)
+            if frame is None or frame.empty:
+                continue
+            pos = self._cached_position(symbol, end)
+            if pos is not None:
+                p = int(pos)
+                idx = p - 1
+            else:
+                try:
+                    idx = frame.index.get_loc(end_ts)
+                    p = idx + 1
+                except KeyError:
+                    continue
+            if idx < 0:
+                continue
+            values = self._snapshot_cache_1h.get(symbol)
+            if values is None:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "history": p,
+                    "price": float(values["close"][idx]),
+                    "ret_24h": float(values["ret_24h"][idx]),
+                    "ret_72h": float(values["ret_72h"][idx]),
+                    "ret_6h": float(values["ret_6h"][idx]),
+                    "above_ma20": bool(values["above_ma20"][idx]),
+                    "qv_6h": float(values["qv_6h_sum"][idx]),
+                    "qv_24h": float(values["qv_24h_sum"][idx]),
+                    "qv_30_avg": float(values["qv_30_avg"][idx]),
+                    "wick_ratio": float(values["wick_ratio"][idx]),
+                    "new_12h_high": bool(values["new_12h_high"][idx]),
+                    "regime_vol_expansion": bool(values["regime_vol_expansion"][idx]),
+                    "atr": float(values["atr14"][idx]),
+                }
+            )
         return pd.DataFrame(rows)
 
     def _last_prices(self, candles: dict[str, pd.DataFrame]) -> dict[str, float]:
@@ -1214,6 +1321,12 @@ class ResearchBacktester:
                 cr = high - low
                 frame["wick_ratio"] = (high - close) / cr.replace(0, np.nan)
                 frame["new_12h_high"] = high > high.rolling(12).max().shift(1)
+                regime_avg_volume = volume.shift(2).rolling(48).mean()
+                regime_recent_volume = volume.rolling(6).mean()
+                frame["regime_vol_expansion"] = (
+                    regime_recent_volume / regime_avg_volume.replace(0, np.nan)
+                    >= self.config.pump_mode.regime_hot_volume_expansion_ratio
+                )
 
                 frame.loc[(vol_ratio >= 1.2) & (price_change > 0.005), "volume_score_col"] = (
                     0.8 + ((vol_ratio - 1.2) * 0.2).clip(upper=0.2)
@@ -1488,6 +1601,28 @@ class ResearchBacktester:
         if median_ret >= cfg.regime_warm_24h_return_pct and nh_r >= cfg.regime_warm_new_high_ratio: return "WARM"
         return "COLD"
 
+    def _detect_pump_regime_snapshot(self, snapshot: pd.DataFrame) -> str:
+        cfg = self.config.pump_mode
+        if snapshot.empty:
+            return "COLD"
+        eligible = snapshot[snapshot["history"].astype(int) >= 50]
+        total = len(eligible)
+        if total < 20:
+            return "COLD"
+        ret_24h = [float(value) for value in eligible["ret_24h"].tolist() if pd.notna(value)]
+        if not ret_24h:
+            return "COLD"
+        median_ret = sorted(ret_24h)[len(ret_24h) // 2]
+        new_high_count = int(eligible["new_12h_high"].fillna(False).astype(bool).sum())
+        vol_exp_count = int(eligible["regime_vol_expansion"].fillna(False).astype(bool).sum())
+        nh_r = new_high_count / total
+        ve_r = vol_exp_count / total
+        if median_ret >= cfg.regime_hot_24h_return_pct and nh_r >= cfg.regime_hot_new_high_ratio and ve_r >= 0.05:
+            return "HOT"
+        if median_ret >= cfg.regime_warm_24h_return_pct and nh_r >= cfg.regime_warm_new_high_ratio:
+            return "WARM"
+        return "COLD"
+
     def _pump_candidates(
         self,
         candles_1h: dict[str, pd.DataFrame],
@@ -1561,6 +1696,94 @@ class ResearchBacktester:
             if atr is None or atr <= 0: continue
             score = ret_24h * 0.45 + ret_72h * 0.35 + ret_6h * 0.10 + min(volume_ratio / 5.0, 1.0) * 0.10
             tier = 'A' if (regime=='WARM' and (early or warm_early_ok) and 0.45<=ret_72h<=0.86 and volume_ratio<=15) else 'B'
+            sig_type = "early_confirmed" if (early and confirmed_sig) else ("early" if early else "confirmed")
+            reason = f"pump_{regime}_{tier}_{sig_type}"
+            candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
+                reason=reason, ret_6h=ret_6h, ret_24h=ret_24h, ret_72h=ret_72h, volume_ratio=volume_ratio,
+                quote_volume_24h=quote_volume_24h, tier=tier))
+        return sorted(candidates, key=lambda item: item.score, reverse=True)
+
+    def _pump_candidates_from_snapshot(
+        self,
+        snapshot: pd.DataFrame,
+        portfolio: Portfolio,
+        equity: float,
+        now: datetime,
+    ) -> list[PumpCandidate]:
+        cfg = self.config.pump_mode
+        if not cfg.enabled or equity <= 0 or snapshot.empty:
+            return []
+        if portfolio.daily_realized_loss < 0 and abs(portfolio.daily_realized_loss) > equity * cfg.max_daily_loss_pct:
+            return []
+        regime = self._pump_regime
+        if regime == "COLD":
+            return []
+        consecutive_losses = 0
+        for won in reversed(portfolio.pump_trade_results):
+            if won:
+                break
+            consecutive_losses += 1
+        self._pump_consecutive_losses = consecutive_losses
+
+        candidates: list[PumpCandidate] = []
+        for row in snapshot.itertuples(index=False):
+            symbol = str(row.symbol)
+            if symbol in portfolio.positions or int(row.history) < 73:
+                continue
+            price = float(row.price)
+            if price <= 0:
+                continue
+            ret_24h = float(row.ret_24h)
+            if pd.isna(ret_24h) or ret_24h < cfg.min_24h_return:
+                continue
+            ret_72h = float(row.ret_72h)
+            ret_6h = float(row.ret_6h)
+            if pd.isna(ret_72h) or pd.isna(ret_6h):
+                continue
+            if not bool(row.above_ma20):
+                continue
+            q6 = float(row.qv_6h)
+            q30 = float(row.qv_30_avg)
+            quote_volume_24h = float(row.qv_24h)
+            quote_volume_6h = q6
+            volume_ratio = q6 / q30 if q30 > 0 else 0
+            if volume_ratio <= 0:
+                continue
+            if quote_volume_24h < cfg.min_quote_volume_24h and quote_volume_6h < cfg.min_quote_volume_6h:
+                continue
+            if float(row.wick_ratio) >= self.config.risk.blowoff_wick_ratio and bool(row.new_12h_high):
+                continue
+            min_6h = getattr(cfg, "min_6h_return", 0.0)
+            if ret_6h < min_6h:
+                continue
+            early = ret_24h >= cfg.min_24h_return and ret_6h >= cfg.early_6h_return and volume_ratio >= cfg.early_volume_ratio_min
+            confirmed_sig = ret_72h >= cfg.min_72h_return and ret_24h >= cfg.min_24h_return and volume_ratio >= cfg.volume_ratio_min
+            warm_early_ok = False
+            if regime == "WARM":
+                wr6 = getattr(cfg, "warm_early_6h_return", 0.12)
+                wvr = getattr(cfg, "warm_early_volume_ratio_min", 2.0)
+                warm_early_ok = ret_24h >= cfg.min_24h_return and ret_6h >= wr6 and volume_ratio >= wvr
+            signal_ok = ((confirmed_sig or early) and regime == "HOT") or (warm_early_ok and regime == "WARM")
+            if not signal_ok:
+                continue
+            if ret_72h > cfg.max_72h_return_chase:
+                continue
+            if ret_72h > cfg.max_72h_return_entry:
+                continue
+            if ret_72h > 1.20 and ret_6h / max(ret_24h, 0.001) < 0.30:
+                continue
+            risk_multiplier = 1.0
+            if ret_72h > cfg.max_72h_return_reduced_risk:
+                risk_multiplier = cfg.late_chase_risk_multiplier
+            elif ret_72h > cfg.max_72h_return_full_risk:
+                risk_multiplier = cfg.reduced_risk_multiplier
+            if early and confirmed_sig and ret_72h <= cfg.max_72h_return_full_risk:
+                risk_multiplier *= 1.25
+            atr = float(row.atr)
+            if pd.isna(atr) or atr <= 0:
+                continue
+            score = ret_24h * 0.45 + ret_72h * 0.35 + ret_6h * 0.10 + min(volume_ratio / 5.0, 1.0) * 0.10
+            tier = "A" if (regime == "WARM" and (early or warm_early_ok) and 0.45 <= ret_72h <= 0.86 and volume_ratio <= 15) else "B"
             sig_type = "early_confirmed" if (early and confirmed_sig) else ("early" if early else "confirmed")
             reason = f"pump_{regime}_{tier}_{sig_type}"
             candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
