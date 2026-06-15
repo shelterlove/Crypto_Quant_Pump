@@ -77,6 +77,10 @@ class OpenPosition:
     probe_confirmed: bool = False    # True after 4h confirmation add
     probe_add_qty: float = 0.0       # pending scale-in quantity
     entry_vr: float = 0.0            # volume ratio at entry
+    probe_entry_price: float = 0.0
+    confirm_entry_price: float = 0.0
+    avg_entry_price: float = 0.0
+    entry_notional: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -686,6 +690,14 @@ class ResearchBacktester:
     def _last_prices(self, candles: dict[str, pd.DataFrame]) -> dict[str, float]:
         return {symbol: float(frame["close"].iloc[-1]) for symbol, frame in candles.items() if not frame.empty}
 
+    @staticmethod
+    def _trade_entry_price(position: OpenPosition) -> float:
+        return position.avg_entry_price if position.position_type == "pump" and position.avg_entry_price > 0 else position.entry_price
+
+    @staticmethod
+    def _trade_entry_notional(position: OpenPosition) -> float:
+        return position.entry_notional if position.entry_notional > 0 else position.quantity * position.entry_price
+
     def _market_state(
         self,
         btc_4h: pd.DataFrame,
@@ -753,10 +765,23 @@ class ResearchBacktester:
                         if est_cost <= portfolio.cash:
                             scale_order = broker.execute_market(symbol, "buy", add_qty, next_open, f"probe_confirm_{position.probe_tier}")
                             portfolio.cash -= scale_order.quantity * scale_order.filled_price + scale_order.fee
+                            entry_notional = self._trade_entry_notional(position) + scale_order.quantity * scale_order.filled_price
                             position.quantity += scale_order.quantity
+                            position.entry_notional = entry_notional
+                            position.avg_entry_price = entry_notional / position.quantity if position.quantity > 0 else position.entry_price
+                            position.confirm_entry_price = scale_order.filled_price
                             orders.append(scale_order)
                             self._write_orders(session, run_id, next_time, [scale_order],
-                                [OrderMetadata(mechanism="pump_probe_confirm", trigger=f"probe_{position.probe_tier}_scale_in")])
+                                [OrderMetadata(
+                                    mechanism="pump_probe_confirm",
+                                    trigger=f"probe_{position.probe_tier}_scale_in",
+                                    details={
+                                        "probe_entry_price": position.probe_entry_price or position.entry_price,
+                                        "confirm_entry_price": position.confirm_entry_price,
+                                        "avg_entry_price": position.avg_entry_price,
+                                        "entry_notional": position.entry_notional,
+                                    },
+                                )])
                 elif forced_reason is not None:
                     next_open = self._next_open(candles_1h, symbol, next_time)
                     if next_open is not None:
@@ -856,9 +881,10 @@ class ResearchBacktester:
         if order.filled_price <= 0:
             return
         orders.append(order)
-        pnl = (order.filled_price - position.entry_price) * position.quantity - order.fee
+        entry_anchor = self._trade_entry_price(position)
+        pnl = (order.filled_price - entry_anchor) * position.quantity - order.fee
         portfolio.cash += order.quantity * order.filled_price - order.fee
-        won = order.filled_price > position.entry_price
+        won = order.filled_price > entry_anchor
         portfolio.record_trade(pnl, won, position.position_type)
         if self._last_engine is not None:
             self._last_engine.feed_trade_result(won)
@@ -871,7 +897,7 @@ class ResearchBacktester:
             if len(self._pump_recent_exits) > lookback * 2:
                 self._pump_recent_exits = self._pump_recent_exits[-lookback * 2:]
             # Record post-entry price path for analysis
-            post = self._compute_post_entry_path(candles_1h, symbol, position.opened_at, position.entry_price, trigger_time)
+            post = self._compute_post_entry_path(candles_1h, symbol, position.opened_at, entry_anchor, trigger_time)
             if post:
                 post['symbol'] = symbol; post['exit_reason'] = reason; post['pnl'] = pnl
                 self._pump_post_entry.append(post)
@@ -1101,15 +1127,16 @@ class ResearchBacktester:
 
         high = float(current["high"].max())
         close = float(current["close"].iloc[-1])
-        position.highest_price = max(position.highest_price or position.entry_price, high)
-        mfe_pct = position.highest_price / position.entry_price - 1
+        anchor_price = self._trade_entry_price(position)
+        position.highest_price = max(position.highest_price or anchor_price, high)
+        mfe_pct = position.highest_price / anchor_price - 1
         position.max_favorable_pct = max(position.max_favorable_pct, mfe_pct)
 
         held_hours = (ensure_utc(now) - ensure_utc(position.opened_at)).total_seconds() / 3600
 
         # v2.0: probe confirmation at 4h
         if position.is_probe and not position.probe_confirmed and held_hours >= 3.5:
-            ret_4h_val = close / position.entry_price - 1
+            ret_4h_val = close / anchor_price - 1
             if ret_4h_val >= 0:
                 # Confirm: mark for scale-in (handled in _process_stops)
                 remaining_qty = position.probe_full_qty - position.quantity
@@ -1127,9 +1154,9 @@ class ResearchBacktester:
 
         if len(current) >= 3:
             post_close = current['close'].astype(float)
-            h1 = float(post_close.iloc[-3] / position.entry_price - 1) if len(post_close) >= 3 else 0
-            h2 = float(post_close.iloc[-2] / position.entry_price - 1) if len(post_close) >= 2 else 0
-            h3 = float(post_close.iloc[-1] / position.entry_price - 1)
+            h1 = float(post_close.iloc[-3] / anchor_price - 1) if len(post_close) >= 3 else 0
+            h2 = float(post_close.iloc[-2] / anchor_price - 1) if len(post_close) >= 2 else 0
+            h3 = float(post_close.iloc[-1] / anchor_price - 1)
             if h1 < 0 and h2 < h1 and h3 < h2:
                 position.stop_mechanism = 'pump_3h_down'
                 position.stop_trigger = 'pump_consecutive_down'
@@ -1138,7 +1165,7 @@ class ResearchBacktester:
             position.stop_mechanism = "pump_stagnation_exit"
             position.stop_trigger = "pump_no_fast_follow_through"
             return "pump_stagnation_exit"
-        if held_hours >= cfg.time_stop_hours and close < position.entry_price * (1 + cfg.time_stop_min_profit_pct):
+        if held_hours >= cfg.time_stop_hours and close < anchor_price * (1 + cfg.time_stop_min_profit_pct):
             position.stop_mechanism = "pump_time_exit"
             position.stop_trigger = "pump_time_stop"
             return "pump_time_exit"
@@ -1147,18 +1174,18 @@ class ResearchBacktester:
         mechanism = position.stop_mechanism
         trigger = position.stop_trigger
         if mfe_pct >= 0.15:
-            protected = position.entry_price * (1 - 0.03)
+            protected = anchor_price * (1 - 0.03)
             if protected > new_stop:
                 new_stop = protected
                 mechanism = "pump_profit_protect"
                 trigger = "low_below_pump_profit_protect"
         # v2.2: same lock/breakeven for all positions (keep v2.0's working levels)
-        if mfe_pct >= 0.08 and position.entry_price > new_stop:
-            new_stop = position.entry_price
+        if mfe_pct >= 0.08 and anchor_price > new_stop:
+            new_stop = anchor_price
             mechanism = "pump_breakeven"
             trigger = "pump_be_8pct"
         if mfe_pct >= 0.10:
-            lock_stop = position.entry_price * 1.02
+            lock_stop = anchor_price * 1.02
             if lock_stop > new_stop:
                 new_stop = lock_stop
                 mechanism = "pump_lock_2pct"
@@ -1186,6 +1213,7 @@ class ResearchBacktester:
             position.last_stop_update = {
                 "trigger": mechanism,
                 "mfe_pct": mfe_pct,
+                "stop_anchor_price": anchor_price,
                 "highest_price": position.highest_price,
             }
         return None
@@ -1464,23 +1492,33 @@ class ResearchBacktester:
         trigger_time: datetime,
     ) -> dict[str, object]:
         history = self._position_history(current, position.opened_at)
+        entry_anchor = self._trade_entry_price(position)
         if history.empty:
-            high = position.entry_price
-            low = position.entry_price
-            close = position.entry_price
+            high = entry_anchor
+            low = entry_anchor
+            close = entry_anchor
         else:
             high = float(history["high"].max())
             low = float(history["low"].min())
             close = float(history["close"].iloc[-1])
+        highest_price = max(position.highest_price or entry_anchor, high)
         return {
             "entry_price": position.entry_price,
+            "probe_entry_price": position.probe_entry_price or position.entry_price,
+            "confirm_entry_price": position.confirm_entry_price,
+            "avg_entry_price": entry_anchor,
+            "stop_anchor_price": entry_anchor,
+            "active_stop_price": position.stop_price,
             "exit_price": exit_price,
+            "exit_reason": position.stop_mechanism,
+            "final_trade_ret_pct": exit_price / entry_anchor - 1 if entry_anchor > 0 else 0,
             "atr": position.atr,
             "stop_before_update": stop_before,
             "stop_after_update": position.stop_price,
-            "highest_price": max(position.highest_price or position.entry_price, high),
-            "mfe_atr": (high - position.entry_price) / position.atr if position.atr > 0 else 0,
-            "mae_atr": (low - position.entry_price) / position.atr if position.atr > 0 else 0,
+            "highest_price": highest_price,
+            "mfe_trade_level": highest_price / entry_anchor - 1 if entry_anchor > 0 else 0,
+            "mfe_atr": (high - entry_anchor) / position.atr if position.atr > 0 else 0,
+            "mae_atr": (low - entry_anchor) / position.atr if position.atr > 0 else 0,
             "trigger_time": trigger_time.isoformat(),
             "opened_at": position.opened_at.isoformat(),
             "position_state": "closed",
@@ -1873,6 +1911,9 @@ class ResearchBacktester:
                 is_probe=True,
                 probe_full_qty=full_quantity,
                 probe_tier=candidate.tier,
+                probe_entry_price=order.filled_price,
+                avg_entry_price=order.filled_price,
+                entry_notional=order.quantity * order.filled_price,
             )
             portfolio.positions[candidate.symbol] = position
             orders.append(order)
@@ -1891,6 +1932,9 @@ class ResearchBacktester:
                             "strategy_type": "pump",
                             "signal_time": now.isoformat(),
                             "entry_price": order.filled_price,
+                            "probe_entry_price": order.filled_price,
+                            "avg_entry_price": order.filled_price,
+                            "stop_anchor_price": order.filled_price,
                             "stop_price": stop_price,
                             "atr": candidate.atr,
                             "risk_multiplier": candidate.risk_multiplier,
@@ -2044,7 +2088,8 @@ class ResearchBacktester:
         current_price: float,
         equity: float | None = None,
     ) -> None:
-        stop_distance = max(position.entry_price - position.stop_price, 0)
+        entry_anchor = self._trade_entry_price(position)
+        stop_distance = max(entry_anchor - position.stop_price, 0)
         denom = max(equity or self.config.backtest.initial_equity, 1)
         exposure = position.quantity * stop_distance / denom
         session.add(
@@ -2053,7 +2098,7 @@ class ResearchBacktester:
                 symbol=position.symbol,
                 state=state,
                 quantity=position.quantity,
-                entry_price=position.entry_price,
+                entry_price=entry_anchor,
                 current_price=current_price,
                 atr=position.atr,
                 stop_price=position.stop_price,
