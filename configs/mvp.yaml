@@ -1,0 +1,7 @@
+extends: configs/default.yaml
+backtest:
+  initial_equity: 100000
+  fee_bps: 10
+  slippage_bps: 5
+  pessimistic_slippage_bps: 15
+  cost_mode: basic

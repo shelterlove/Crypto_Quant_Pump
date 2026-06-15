@@ -1,0 +1,116 @@
+database_url: postgresql+psycopg://crypto_quant:crypto_quant@localhost:5439/crypto_quant
+exchange_id: binance
+strategy_version: v1.4.2
+base_currency: USDT
+timeframes:
+  primary: 1h
+  trend: 4h
+universe:
+  top_n: 60
+  min_quote_volume_30d: 10000000
+  # Mega-cap exclusion — keep BTC for market state, trade only altcoins
+  mega_cap_exclude:
+    - BTC
+    - ETH
+    - BNB
+    - SOL
+    - XRP
+    - ADA
+    - DOGE
+    - TRX
+    - LINK
+    - AVAX
+    - TON
+    - DOT
+    - MATIC
+    - SHIB
+    - LTC
+    - BCH
+    - UNI
+    - ATOM
+    - XLM
+    - ETC
+  exclude_keywords:
+    - USDC
+    - USDT
+    - DAI
+    - BUSD
+    - TUSD
+    - USDP
+    - FDUSD
+    - UP
+    - DOWN
+    - BULL
+    - BEAR
+    # Quasi-stablecoins and non-crypto instruments
+    - USD1
+    - USDE
+    - USR
+    - USDY
+    - EURI
+    - AEUR
+    - PAXG
+    - XAUT
+    - BFUSD
+    - FRAX
+risk:
+  trade_risk_pct: 0.01
+  max_symbol_position_pct: 0.35
+  max_positions: 3
+  atr_period: 14
+  atr_stop_multiple: 2.0
+  max_single_volatility_risk_pct: 0.03
+  max_portfolio_stop_risk_pct: 0.03
+  max_portfolio_volatility_risk_pct: 0.06
+  # v1: breakeven / trailing stop parameters tuned from backtest data
+  # breakeven at 2x ATR (was 1x — too tight, caused 4h median hold)
+  # trailing at 2x ATR from high (was 3x — too wide, missed profits)
+  enable_breakeven_stop: true
+  breakeven_activation_atr_multiple: 2.0
+  breakeven_buffer_bps: 0.0
+  enable_trailing_stop: true
+  trailing_activation_atr_multiple: 2.0
+  trailing_stop_atr_multiple: 3.5
+  defensive_tighten_existing_positions: true
+  defensive_tighten_atr_multiple: 1.0
+  # v1: volume confirmation disabled — backtest shows it filters out positive-alpha signals
+  volume_confirmation_enabled: false
+  volume_confirmation_lookback_hours: 6
+  volume_confirmation_average_hours: 20
+  volume_confirmation_min_ratio: 1.0
+  # v1: daily loss circuit breaker
+  daily_loss_limit_pct: 0.12
+  daily_loss_defensive_pct: 0.18
+  consecutive_loss_pause_count: 15
+  consecutive_loss_pause_hours: 0.5
+  recent_trades_lookback: 25
+  recent_trades_loss_threshold: 18
+  # v1: volume-stall filter (white paper §5.4)
+  volume_stall_enabled: true
+  volume_stall_lookback_bars: 6
+  volume_stall_volume_lookback_hours: 20
+  volume_stall_volume_ratio: 1.5
+  volume_stall_min_bars_above: 4
+  volume_stall_high_rejection_pct: 0.995
+  volume_stall_return_threshold: 0.015
+  volume_stall_drawdown_threshold: 0.015
+  volume_stall_top_return_pct: 0.2
+  cooldown_hours: 4.0
+  # v1: position state machine — weakening reduces position
+  weakening_reduction_pct: 0.33
+  weakening_trailing_multiple: 1.5
+market_state:
+  btc_symbol: BTC/USDT
+  ma_period: 50
+  slope_lookback_bars: 4
+  bearish_slope_threshold: -0.005
+  breadth_threshold: 0.5
+momentum:
+  windows_hours: [4, 24, 48, 72]
+  weights: [0.25, 0.35, 0.25, 0.15]
+backtest:
+  initial_equity: 100000
+  fee_bps: 10
+  slippage_bps: 5
+  pessimistic_slippage_bps: 15
+  cost_mode: basic

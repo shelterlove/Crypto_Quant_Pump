@@ -1,0 +1,2 @@
+extends: configs/v1.yaml
+database_url: postgresql+psycopg://crypto_quant:crypto_quant@localhost:5439/crypto_quant

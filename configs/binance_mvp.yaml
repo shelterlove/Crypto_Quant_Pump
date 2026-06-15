@@ -1,0 +1,7 @@
+extends: configs/mvp.yaml
+exchange_id: binance
+universe:
+  min_quote_volume_30d: 50000000
+pipeline:
+  slippage_pressure_bps: []
+  prefer_local_symbol_cache: true

@@ -1,0 +1,34 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.venv/
+
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime data and generated outputs
+reports/
+freqtrade_user_data/logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local assistant/editor state
+.agents/
+.codex/
+.claude/
+.omc/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
