@@ -433,6 +433,35 @@ def binned_trade_summary(trades: pd.DataFrame, column: str, bins: list[float], l
     return grouped_trade_summary(frame, [f"{column}_bin"])
 
 
+def add_bin_columns(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return trades.copy()
+    frame = trades.copy()
+    frame["anchor_gap_bin"] = pd.cut(
+        frame["anchor_gap_pct"], [-1_000, 0, 2, 5, 10, 20, 1_000], labels=["<=0", "0-2", "2-5", "5-10", "10-20", ">20"], include_lowest=True
+    )
+    frame["mfe_bin"] = pd.cut(
+        frame["mfe_trade_pct"], [-1_000, 5, 10, 15, 20, 40, 1_000], labels=["<5", "5-10", "10-15", "15-20", "20-40", ">40"], include_lowest=True
+    )
+    frame["r72_bin"] = pd.cut(
+        frame["ret_72h"], [-1_000, 0.45, 0.86, 1.2, 2.2, 3.5, 1_000], labels=["<45%", "45-86%", "86-120%", "120-220%", "220-350%", ">350%"], include_lowest=True
+    )
+    frame["r6_bin"] = pd.cut(
+        frame["ret_6h"], [-1_000, 0.12, 0.25, 0.50, 1.0, 1_000], labels=["<12%", "12-25%", "25-50%", "50-100%", ">100%"], include_lowest=True
+    )
+    frame["vr_bin"] = pd.cut(
+        frame["volume_ratio"], [-1_000, 2, 5, 10, 15, 30, 1_000], labels=["<2", "2-5", "5-10", "10-15", "15-30", ">30"], include_lowest=True
+    )
+    ema_bins = [-0.01, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.01]
+    ema_labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-90%", "90-95%", "95-100%"]
+    frame["ema90_bin"] = pd.cut(frame["ema20_dev_rank_90h"], ema_bins, labels=ema_labels, include_lowest=True)
+    frame["ema2160_bin"] = pd.cut(frame["ema20_dev_rank_2160h"], ema_bins, labels=ema_labels, include_lowest=True)
+    frame["ema_slope_state"] = "flat_or_down"
+    frame.loc[(frame["ema20_slope_3_pct"] > 0) | (frame["ema20_slope_6_pct"] > 0), "ema_slope_state"] = "up"
+    frame["ema_state"] = frame["ema2160_bin"].astype(str) + "_" + frame["ema_slope_state"].astype(str)
+    return frame
+
+
 def focused_exit_summary(trades: pd.DataFrame) -> pd.DataFrame:
     if trades.empty:
         return pd.DataFrame()
@@ -477,51 +506,24 @@ def bad_exit_diagnostics(trades: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_trade_bins(output: dict[str, pd.DataFrame], trades: pd.DataFrame) -> None:
+    trades = add_bin_columns(trades)
+    output["pump_trade_diagnostics_binned"] = trades
     output["pump_exit_summary"] = grouped_trade_summary(trades, ["exit_mechanism"])
     output["pump_entry_group_summary"] = grouped_trade_summary(trades, ["regime", "tier", "confirmed_group"])
     output["pump_signal_type_summary"] = grouped_trade_summary(trades, ["signal_type"])
-    output["pump_anchor_gap_bins"] = binned_trade_summary(
-        trades,
-        "anchor_gap_pct",
-        [-1_000, 0, 2, 5, 10, 20, 1_000],
-        ["<=0", "0-2", "2-5", "5-10", "10-20", ">20"],
-    )
-    output["pump_mfe_bins"] = binned_trade_summary(
-        trades,
-        "mfe_trade_pct",
-        [-1_000, 5, 10, 15, 20, 40, 1_000],
-        ["<5", "5-10", "10-15", "15-20", "20-40", ">40"],
-    )
-    output["pump_r72_bins"] = binned_trade_summary(
-        trades,
-        "ret_72h",
-        [-1_000, 0.45, 0.86, 1.2, 2.2, 3.5, 1_000],
-        ["<45%", "45-86%", "86-120%", "120-220%", "220-350%", ">350%"],
-    )
-    output["pump_r6_bins"] = binned_trade_summary(
-        trades,
-        "ret_6h",
-        [-1_000, 0.12, 0.25, 0.50, 1.0, 1_000],
-        ["<12%", "12-25%", "25-50%", "50-100%", ">100%"],
-    )
-    output["pump_vr_bins"] = binned_trade_summary(
-        trades,
-        "volume_ratio",
-        [-1_000, 2, 5, 10, 15, 30, 1_000],
-        ["<2", "2-5", "5-10", "10-15", "15-30", ">30"],
-    )
-    output["pump_ema20_dev_rank_90h_bins"] = binned_trade_summary(
-        trades,
-        "ema20_dev_rank_90h",
-        [-0.01, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.01],
-        ["0-20%", "20-40%", "40-60%", "60-80%", "80-90%", "90-95%", "95-100%"],
-    )
-    output["pump_ema20_dev_rank_2160h_bins"] = binned_trade_summary(
-        trades,
-        "ema20_dev_rank_2160h",
-        [-0.01, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.01],
-        ["0-20%", "20-40%", "40-60%", "60-80%", "80-90%", "90-95%", "95-100%"],
-    )
+    output["pump_anchor_gap_bins"] = grouped_trade_summary(trades, ["anchor_gap_bin"])
+    output["pump_mfe_bins"] = grouped_trade_summary(trades, ["mfe_bin"])
+    output["pump_r72_bins"] = grouped_trade_summary(trades, ["r72_bin"])
+    output["pump_r6_bins"] = grouped_trade_summary(trades, ["r6_bin"])
+    output["pump_vr_bins"] = grouped_trade_summary(trades, ["vr_bin"])
+    output["pump_ema20_dev_rank_90h_bins"] = grouped_trade_summary(trades, ["ema90_bin"])
+    output["pump_ema20_dev_rank_2160h_bins"] = grouped_trade_summary(trades, ["ema2160_bin"])
+    output["pump_ema2160_x_r6"] = grouped_trade_summary(trades, ["ema2160_bin", "r6_bin"])
+    output["pump_ema2160_x_vr"] = grouped_trade_summary(trades, ["ema2160_bin", "vr_bin"])
+    output["pump_tier_confirmed_ema_vr"] = grouped_trade_summary(trades, ["tier", "confirmed_group", "ema2160_bin", "vr_bin"])
+    output["pump_tier_confirmed_ema_r6"] = grouped_trade_summary(trades, ["tier", "confirmed_group", "ema2160_bin", "r6_bin"])
+    output["pump_ema_state_summary"] = grouped_trade_summary(trades, ["ema_state"])
+    output["pump_trailing_trades"] = trades[trades["exit_mechanism"] == "pump_trailing_stop"].sort_values("net_pnl", ascending=False)
     output["pump_focused_exit_summary"] = focused_exit_summary(trades)
     output["pump_lock_breakeven_diagnostics"] = lock_breakeven_diagnostics(trades)
     output["pump_bad_exit_diagnostics"] = bad_exit_diagnostics(trades)
