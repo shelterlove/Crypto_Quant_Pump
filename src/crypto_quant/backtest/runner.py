@@ -351,7 +351,7 @@ class ResearchBacktester:
                 pump_prices: dict[str, float] = {}
                 if self.config.pump_mode.enabled and pump_scan_1h:
                     if now >= self._pump_cooldown_until:
-                        if True:  # v2.5 debug: disable cache to isolate cause of +213.9%
+                        if not hasattr(self, '_last_regime_check') or (now - self._last_regime_check).total_seconds() >= 14400:
                             self._pump_regime = self._detect_pump_regime(pump_scan_1h)
                             self._last_regime_check = now
                         if self._pump_regime in ("HOT", "WARM"):
