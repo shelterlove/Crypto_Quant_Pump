@@ -367,36 +367,3 @@ def test_b_unconfirmed_probe_exits_directly_after_4h_loss() -> None:
 
     assert reason == "pump_b_unconfirmed_4h_down"
     assert position.stop_mechanism == "pump_b_unconfirmed_4h_down"
-
-
-def test_core_confirmed_gets_breathing_stop_before_mfe_threshold() -> None:
-    cfg = load_config("configs/mvp.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
-    backtester = ResearchBacktester(cfg)
-    position = OpenPosition(
-        "AAA/USDT",
-        quantity=1,
-        entry_price=100,
-        stop_price=80,
-        atr=5,
-        opened_at=datetime(2024, 1, 1, tzinfo=UTC),
-        position_type="pump",
-        stop_mechanism="pump_initial_stop",
-        avg_entry_price=100,
-        entry_notional=100,
-        pump_entry_quality="core_confirmed",
-        breathing_stop_allowed=True,
-    )
-    current = pd.DataFrame(
-        {
-            "open_time": pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC"),
-            "high": [102, 103, 104, 104],
-            "low": [98, 97, 96, 95],
-            "close": [99, 98, 97, 96],
-        }
-    ).set_index("open_time", drop=False)
-
-    reason = backtester._update_pump_stop(position, current, datetime(2024, 1, 1, 3, tzinfo=UTC))
-
-    assert reason is None
-    assert position.stop_mechanism == "pump_breathing_stop"
-    assert position.stop_price == pytest.approx(92)

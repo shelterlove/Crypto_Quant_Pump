@@ -81,8 +81,6 @@ class OpenPosition:
     confirm_entry_price: float = 0.0
     avg_entry_price: float = 0.0
     entry_notional: float = 0.0
-    pump_entry_quality: str = ""
-    breathing_stop_allowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -700,21 +698,6 @@ class ResearchBacktester:
     def _trade_entry_notional(position: OpenPosition) -> float:
         return position.entry_notional if position.entry_notional > 0 else position.quantity * position.entry_price
 
-    def _pump_entry_quality(self, candidate: PumpCandidate) -> tuple[str, bool]:
-        cfg = self.config.pump_mode
-        confirmed = "confirmed" in candidate.reason
-        core_confirmed = (
-            confirmed
-            and cfg.core_confirmed_min_72h_return <= candidate.ret_72h <= cfg.core_confirmed_max_72h_return
-            and candidate.ret_6h <= cfg.core_confirmed_max_6h_return
-            and candidate.volume_ratio < cfg.core_confirmed_max_volume_ratio
-        )
-        if core_confirmed:
-            return "core_confirmed", True
-        if confirmed:
-            return "weak_confirmed", False
-        return "unconfirmed", False
-
     def _market_state(
         self,
         btc_4h: pd.DataFrame,
@@ -1151,7 +1134,6 @@ class ResearchBacktester:
 
         held_hours = (ensure_utc(now) - ensure_utc(position.opened_at)).total_seconds() / 3600
         is_unconfirmed_b = position.is_probe and position.probe_tier == "B" and not position.probe_confirmed
-        breathing_active = position.breathing_stop_allowed and mfe_pct < cfg.breathing_stop_pre_mfe_pct
 
         # v2.0: probe confirmation at 4h
         if position.is_probe and not position.probe_confirmed and held_hours >= 3.5:
@@ -1184,15 +1166,15 @@ class ResearchBacktester:
                 position.stop_mechanism = "pump_b_unconfirmed_3h_down"
                 position.stop_trigger = "pump_b_ret_3h_cut"
                 return "pump_b_unconfirmed_3h_down"
-            if not breathing_active and h1 < 0 and h2 < h1 and h3 < h2:
+            if h1 < 0 and h2 < h1 and h3 < h2:
                 position.stop_mechanism = 'pump_3h_down'
                 position.stop_trigger = 'pump_consecutive_down'
                 return 'pump_3h_down'
-        if not breathing_active and held_hours >= cfg.stagnation_stop_hours and position.max_favorable_pct < cfg.stagnation_min_mfe_pct:
+        if held_hours >= cfg.stagnation_stop_hours and position.max_favorable_pct < cfg.stagnation_min_mfe_pct:
             position.stop_mechanism = "pump_stagnation_exit"
             position.stop_trigger = "pump_no_fast_follow_through"
             return "pump_stagnation_exit"
-        if not breathing_active and held_hours >= cfg.time_stop_hours and close < anchor_price * (1 + cfg.time_stop_min_profit_pct):
+        if held_hours >= cfg.time_stop_hours and close < anchor_price * (1 + cfg.time_stop_min_profit_pct):
             position.stop_mechanism = "pump_time_exit"
             position.stop_trigger = "pump_time_stop"
             return "pump_time_exit"
@@ -1200,12 +1182,6 @@ class ResearchBacktester:
         new_stop = position.stop_price
         mechanism = position.stop_mechanism
         trigger = position.stop_trigger
-        if breathing_active:
-            breathing_stop = anchor_price * (1 + cfg.breathing_stop_loss_pct)
-            if breathing_stop > new_stop:
-                new_stop = breathing_stop
-                mechanism = "pump_breathing_stop"
-                trigger = "pump_core_confirmed_breathing"
         if mfe_pct >= 0.15:
             protected = anchor_price * (1 - 0.03)
             if protected > new_stop:
@@ -1248,8 +1224,6 @@ class ResearchBacktester:
                 "mfe_pct": mfe_pct,
                 "stop_anchor_price": anchor_price,
                 "highest_price": position.highest_price,
-                "breathing_active": breathing_active,
-                "pump_entry_quality": position.pump_entry_quality,
             }
         return None
 
@@ -1558,8 +1532,6 @@ class ResearchBacktester:
             "opened_at": position.opened_at.isoformat(),
             "position_state": "closed",
             "strategy_type": position.position_type,
-            "pump_entry_quality": position.pump_entry_quality,
-            "breathing_stop_allowed": position.breathing_stop_allowed,
             "market_state": market_state.state,
             "market_reasons": market_state.reasons,
             "last_close": close,
@@ -1912,7 +1884,6 @@ class ResearchBacktester:
                 self._reject(session, run_id, now, candidate.symbol, "pump_exposure_limit")
                 continue
 
-            pump_quality, breathing_stop_allowed = self._pump_entry_quality(candidate)
             # v2.5B: keep B-tier unconfirmed probes smaller than A-tier probes.
             probe_pct = cfg.probe_pct_a if candidate.tier == "A" else cfg.probe_pct_b
             quantity = full_quantity * probe_pct
@@ -1952,8 +1923,6 @@ class ResearchBacktester:
                 probe_entry_price=order.filled_price,
                 avg_entry_price=order.filled_price,
                 entry_notional=order.quantity * order.filled_price,
-                pump_entry_quality=pump_quality,
-                breathing_stop_allowed=breathing_stop_allowed,
             )
             portfolio.positions[candidate.symbol] = position
             orders.append(order)
@@ -1979,8 +1948,6 @@ class ResearchBacktester:
                             "atr": candidate.atr,
                             "risk_multiplier": candidate.risk_multiplier,
                             "probe_pct": probe_pct,
-                            "pump_entry_quality": pump_quality,
-                            "breathing_stop_allowed": breathing_stop_allowed,
                             "score": candidate.score,
                             "ret_6h": candidate.ret_6h,
                             "ret_24h": candidate.ret_24h,
