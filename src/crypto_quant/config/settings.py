@@ -124,6 +124,12 @@ class PumpModeConfig(BaseModel):
     probe_pct_b: float = 0.25
     unconfirmed_b_ret_4h_exit_pct: float = -0.02
     unconfirmed_b_ret_3h_exit_pct: float = -0.02
+    core_confirmed_min_72h_return: float = 0.45
+    core_confirmed_max_72h_return: float = 0.86
+    core_confirmed_max_6h_return: float = 0.25
+    core_confirmed_max_volume_ratio: float = 10.0
+    breathing_stop_pre_mfe_pct: float = 0.08
+    breathing_stop_loss_pct: float = -0.08
     trailing_1_profit_pct: float = 0.60
     trailing_1_atr_multiple: float = 2.5
     trailing_2_profit_pct: float = 1.00
