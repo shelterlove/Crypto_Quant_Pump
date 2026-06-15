@@ -698,6 +698,16 @@ class ResearchBacktester:
     def _trade_entry_notional(position: OpenPosition) -> float:
         return position.entry_notional if position.entry_notional > 0 else position.quantity * position.entry_price
 
+    def _pump_stop_anchor_price(self, position: OpenPosition) -> float:
+        if (
+            self.config.pump_mode.probe_anchor_breathing_enabled
+            and position.position_type == "pump"
+            and position.probe_confirmed
+            and position.probe_entry_price > 0
+        ):
+            return position.probe_entry_price
+        return self._trade_entry_price(position)
+
     def _market_state(
         self,
         btc_4h: pd.DataFrame,
@@ -1127,9 +1137,11 @@ class ResearchBacktester:
 
         high = float(current["high"].max())
         close = float(current["close"].iloc[-1])
-        anchor_price = self._trade_entry_price(position)
+        anchor_price = self._pump_stop_anchor_price(position)
+        trade_entry_price = self._trade_entry_price(position)
         position.highest_price = max(position.highest_price or anchor_price, high)
         mfe_pct = position.highest_price / anchor_price - 1
+        trade_mfe_pct = position.highest_price / trade_entry_price - 1 if trade_entry_price > 0 else mfe_pct
         position.max_favorable_pct = max(position.max_favorable_pct, mfe_pct)
 
         held_hours = (ensure_utc(now) - ensure_utc(position.opened_at)).total_seconds() / 3600
@@ -1213,7 +1225,9 @@ class ResearchBacktester:
             position.last_stop_update = {
                 "trigger": mechanism,
                 "mfe_pct": mfe_pct,
+                "mfe_trade_level": trade_mfe_pct,
                 "stop_anchor_price": anchor_price,
+                "avg_entry_price": trade_entry_price,
                 "highest_price": position.highest_price,
             }
         return None
@@ -1493,6 +1507,7 @@ class ResearchBacktester:
     ) -> dict[str, object]:
         history = self._position_history(current, position.opened_at)
         entry_anchor = self._trade_entry_price(position)
+        stop_anchor = self._pump_stop_anchor_price(position)
         if history.empty:
             high = entry_anchor
             low = entry_anchor
@@ -1507,7 +1522,7 @@ class ResearchBacktester:
             "probe_entry_price": position.probe_entry_price or position.entry_price,
             "confirm_entry_price": position.confirm_entry_price,
             "avg_entry_price": entry_anchor,
-            "stop_anchor_price": entry_anchor,
+            "stop_anchor_price": stop_anchor,
             "active_stop_price": position.stop_price,
             "exit_price": exit_price,
             "exit_reason": position.stop_mechanism,

@@ -302,8 +302,44 @@ def test_pump_stop_trails_after_large_mfe() -> None:
     assert position.stop_price > 150
 
 
-def test_pump_lock_uses_weighted_average_entry_after_confirm() -> None:
+def test_pump_lock_uses_probe_anchor_when_probe_breathing_enabled() -> None:
     cfg = load_config("configs/mvp.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
+    backtester = ResearchBacktester(cfg)
+    position = OpenPosition(
+        "AAA/USDT",
+        quantity=1,
+        entry_price=100,
+        stop_price=90,
+        atr=20,
+        opened_at=datetime(2024, 1, 1, tzinfo=UTC),
+        position_type="pump",
+        stop_mechanism="pump_initial_stop",
+        probe_entry_price=100,
+        confirm_entry_price=120,
+        avg_entry_price=110,
+        entry_notional=110,
+        probe_confirmed=True,
+    )
+    current = pd.DataFrame(
+        {
+            "open_time": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "high": [111, 122],
+            "low": [109, 116],
+            "close": [110, 121],
+        }
+    ).set_index("open_time", drop=False)
+
+    reason = backtester._update_pump_stop(position, current, datetime(2024, 1, 1, 1, tzinfo=UTC))
+
+    assert reason is None
+    assert position.stop_mechanism == "pump_lock_2pct"
+    assert position.stop_price == pytest.approx(102.0)
+
+
+def test_pump_lock_can_use_weighted_average_entry_when_probe_breathing_disabled() -> None:
+    cfg = load_config("configs/mvp.yaml").model_copy(
+        update={"pump_mode": PumpModeConfig(enabled=True, probe_anchor_breathing_enabled=False)}
+    )
     backtester = ResearchBacktester(cfg)
     position = OpenPosition(
         "AAA/USDT",
