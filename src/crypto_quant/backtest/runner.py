@@ -1133,6 +1133,7 @@ class ResearchBacktester:
         position.max_favorable_pct = max(position.max_favorable_pct, mfe_pct)
 
         held_hours = (ensure_utc(now) - ensure_utc(position.opened_at)).total_seconds() / 3600
+        is_unconfirmed_b = position.is_probe and position.probe_tier == "B" and not position.probe_confirmed
 
         # v2.0: probe confirmation at 4h
         if position.is_probe and not position.probe_confirmed and held_hours >= 3.5:
@@ -1144,6 +1145,10 @@ class ResearchBacktester:
                     position.probe_confirmed = True
                     position.probe_add_qty = remaining_qty
                     return 'probe_confirm'
+            elif is_unconfirmed_b and ret_4h_val <= cfg.unconfirmed_b_ret_4h_exit_pct:
+                position.stop_mechanism = "pump_b_unconfirmed_4h_down"
+                position.stop_trigger = "pump_b_ret_4h_cut"
+                return "pump_b_unconfirmed_4h_down"
             elif ret_4h_val <= -0.02:
                 # Kill: tighten stop to near current price, force exit
                 tight_stop = close - position.atr * 0.3
@@ -1157,6 +1162,10 @@ class ResearchBacktester:
             h1 = float(post_close.iloc[-3] / anchor_price - 1) if len(post_close) >= 3 else 0
             h2 = float(post_close.iloc[-2] / anchor_price - 1) if len(post_close) >= 2 else 0
             h3 = float(post_close.iloc[-1] / anchor_price - 1)
+            if is_unconfirmed_b and h3 <= cfg.unconfirmed_b_ret_3h_exit_pct and close < anchor_price:
+                position.stop_mechanism = "pump_b_unconfirmed_3h_down"
+                position.stop_trigger = "pump_b_ret_3h_cut"
+                return "pump_b_unconfirmed_3h_down"
             if h1 < 0 and h2 < h1 and h3 < h2:
                 position.stop_mechanism = 'pump_3h_down'
                 position.stop_trigger = 'pump_consecutive_down'
@@ -1875,8 +1884,8 @@ class ResearchBacktester:
                 self._reject(session, run_id, now, candidate.symbol, "pump_exposure_limit")
                 continue
 
-            # v2.0: probe entry — A=50%, B=30% of full quantity
-            probe_pct = 0.50 if candidate.tier == "A" else 0.30
+            # v2.5B: keep B-tier unconfirmed probes smaller than A-tier probes.
+            probe_pct = cfg.probe_pct_a if candidate.tier == "A" else cfg.probe_pct_b
             quantity = full_quantity * probe_pct
             if quantity <= 0:
                 self._reject(session, run_id, now, candidate.symbol, "pump_probe_too_small")
@@ -1938,6 +1947,7 @@ class ResearchBacktester:
                             "stop_price": stop_price,
                             "atr": candidate.atr,
                             "risk_multiplier": candidate.risk_multiplier,
+                            "probe_pct": probe_pct,
                             "score": candidate.score,
                             "ret_6h": candidate.ret_6h,
                             "ret_24h": candidate.ret_24h,

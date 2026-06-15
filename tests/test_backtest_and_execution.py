@@ -334,3 +334,36 @@ def test_pump_lock_uses_weighted_average_entry_after_confirm() -> None:
     assert reason is None
     assert position.stop_mechanism == "pump_lock_2pct"
     assert position.stop_price == pytest.approx(112.2)
+
+
+def test_b_unconfirmed_probe_exits_directly_after_4h_loss() -> None:
+    cfg = load_config("configs/mvp.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
+    backtester = ResearchBacktester(cfg)
+    position = OpenPosition(
+        "AAA/USDT",
+        quantity=1,
+        entry_price=100,
+        stop_price=80,
+        atr=5,
+        opened_at=datetime(2024, 1, 1, tzinfo=UTC),
+        position_type="pump",
+        stop_mechanism="pump_initial_stop",
+        is_probe=True,
+        probe_tier="B",
+        probe_entry_price=100,
+        avg_entry_price=100,
+        entry_notional=100,
+    )
+    current = pd.DataFrame(
+        {
+            "open_time": pd.date_range("2024-01-01", periods=5, freq="h", tz="UTC"),
+            "high": [101, 100, 99, 99, 98],
+            "low": [99, 98, 97, 96, 95],
+            "close": [100, 99, 98.5, 98.2, 97.5],
+        }
+    ).set_index("open_time", drop=False)
+
+    reason = backtester._update_pump_stop(position, current, datetime(2024, 1, 1, 4, tzinfo=UTC))
+
+    assert reason == "pump_b_unconfirmed_4h_down"
+    assert position.stop_mechanism == "pump_b_unconfirmed_4h_down"

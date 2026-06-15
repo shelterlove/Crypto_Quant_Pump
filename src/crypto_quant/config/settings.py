@@ -120,6 +120,10 @@ class PumpModeConfig(BaseModel):
     profit_protect_1_pct: float = 0.15
     profit_protect_1_stop_pct: float = -0.03
     breakeven_profit_pct: float = 0.30
+    probe_pct_a: float = 0.50
+    probe_pct_b: float = 0.25
+    unconfirmed_b_ret_4h_exit_pct: float = -0.02
+    unconfirmed_b_ret_3h_exit_pct: float = -0.02
     trailing_1_profit_pct: float = 0.60
     trailing_1_atr_multiple: float = 2.5
     trailing_2_profit_pct: float = 1.00
