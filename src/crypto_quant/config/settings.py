@@ -130,6 +130,8 @@ class PumpModeConfig(BaseModel):
     bad_b_volume_ratio_mid_min: float = 15.0
     bad_b_volume_ratio_mid_max: float = 30.0
     bad_b_risk_multiplier_mid: float = 0.75
+    # v2.5G: hard reject when volume_ratio > 30 (0 trailing across all subsets)
+    bad_b_vr30_reject_enabled: bool = False
     trailing_1_profit_pct: float = 0.60
     trailing_1_atr_multiple: float = 2.5
     trailing_2_profit_pct: float = 1.00

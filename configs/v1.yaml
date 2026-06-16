@@ -86,3 +86,4 @@ pump_mode:
   adaptive_risk_enabled: false
   extended_cooldown_minutes: 0
   bad_b_ema_vr_risk_mid_enabled: true
+  bad_b_vr30_reject_enabled: true
