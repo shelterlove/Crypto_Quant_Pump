@@ -135,6 +135,11 @@ class PumpModeConfig(BaseModel):
     # v2.5G Step 4: reject when risk_multiplier <= threshold (RM=0.40/0.70 have 0 trailing)
     bad_b_low_rm_reject_enabled: bool = False
     bad_b_low_rm_reject_threshold: float = 0.70
+    # v2.5G Step 2: MFE-based floor on avg_entry to prevent high-MFE trades from losing
+    mfe_protect_enabled: bool = False
+    mfe_protect_15pct_mult: float = 1.005
+    mfe_protect_25pct_mult: float = 1.03
+    mfe_protect_40pct_mult: float = 1.08
     trailing_1_profit_pct: float = 0.60
     trailing_1_atr_multiple: float = 2.5
     trailing_2_profit_pct: float = 1.00

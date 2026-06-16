@@ -88,3 +88,4 @@ pump_mode:
   bad_b_ema_vr_risk_mid_enabled: true
   bad_b_vr30_reject_enabled: true
   bad_b_low_rm_reject_enabled: true
+  mfe_protect_enabled: true

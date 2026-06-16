@@ -1220,6 +1220,17 @@ class ResearchBacktester:
                 trigger = "low_below_pump_trailing"
                 position.trailing_active = True
 
+        # v2.5G Step 2: MFE floor on avg_entry — prevent high-MFE trades from losing.
+        # ONLY for unconfirmed trades (anchor ≈ avg_entry). Confirmed trades with
+        # breathing gap already have lock/breakeven/trailing anchored to probe_entry.
+        if cfg.mfe_protect_enabled and trade_entry_price > 0 and anchor_price >= trade_entry_price * 0.98:
+            if trade_mfe_pct >= 0.40:
+                new_stop = max(new_stop, trade_entry_price * cfg.mfe_protect_40pct_mult)
+            elif trade_mfe_pct >= 0.25:
+                new_stop = max(new_stop, trade_entry_price * cfg.mfe_protect_25pct_mult)
+            elif trade_mfe_pct >= 0.15:
+                new_stop = max(new_stop, trade_entry_price * cfg.mfe_protect_15pct_mult)
+
         if new_stop > position.stop_price:
             position.stop_price = new_stop
             position.stop_mechanism = mechanism
