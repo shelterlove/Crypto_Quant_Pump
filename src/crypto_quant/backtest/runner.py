@@ -608,6 +608,7 @@ class ResearchBacktester:
             "close", "volume", "ret_24h", "ret_6h", "ret_72h", "above_ma20",
             "qv_6h_sum", "qv_24h_sum", "qv_30_avg", "wick_ratio",
             "new_12h_high", "regime_vol_expansion", "atr14", "ema20_dev_rank_2160h",
+            "ema20_dev",
         ]
         cache: dict[str, dict[str, np.ndarray]] = {}
         for symbol, frame in candles_1h.items():
@@ -685,6 +686,7 @@ class ResearchBacktester:
                     "regime_vol_expansion": bool(values["regime_vol_expansion"][idx]),
                     "atr": float(values["atr14"][idx]),
                     "ema20_dev_rank_2160h": float(values["ema20_dev_rank_2160h"][idx]),
+                    "ema20_dev": float(values["ema20_dev"][idx]),
                 }
             )
         return pd.DataFrame(rows)
@@ -1856,6 +1858,11 @@ class ResearchBacktester:
             tier = "A" if (regime == "WARM" and (early or warm_early_ok) and 0.45 <= ret_72h <= 0.86 and volume_ratio <= 15) else "B"
             sig_type = "early_confirmed" if (early and confirmed_sig) else ("early" if early else "confirmed")
             ema20_dev_rank_2160h = float(row.ema20_dev_rank_2160h)
+            # v2.5G abs EMA filter: reject weak absolute deviation
+            if getattr(cfg, 'ema_abs_min_enabled', False):
+                ema_abs = float(getattr(row, 'ema20_dev', 0)) * 100  # ratio → percentage
+                if ema_abs < cfg.ema_abs_min_threshold:
+                    continue
             if (
                 cfg.bad_b_ema_vr_risk_enabled
                 and tier == "B"
