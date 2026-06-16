@@ -142,6 +142,9 @@ class PumpModeConfig(BaseModel):
     # v2.5G: reject candidates with weak absolute EMA deviation
     ema_abs_min_enabled: bool = False
     ema_abs_min_threshold: float = 10.0  # reject if ema20_dev_pct < 10%
+    # v2.5G: equity peak-ratio position scaling
+    equity_peak_risk_enabled: bool = False
+    equity_peak_risk_floor: float = 0.50  # minimum risk multiplier
     mfe_protect_40pct_mult: float = 1.08
     trailing_1_profit_pct: float = 0.60
     trailing_1_atr_multiple: float = 2.5

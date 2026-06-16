@@ -90,3 +90,5 @@ pump_mode:
   bad_b_low_rm_reject_enabled: true
   mfe_protect_enabled: true
   ema_abs_min_enabled: true
+  equity_peak_risk_enabled: true
+  equity_peak_risk_floor: 0.70

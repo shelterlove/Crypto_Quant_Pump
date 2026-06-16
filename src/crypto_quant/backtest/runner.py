@@ -244,7 +244,7 @@ class ResearchBacktester:
             self._snapshot_cache_1h = self._build_snapshot_value_cache(candles_1h)
             portfolio = Portfolio(cash=self.config.backtest.initial_equity, initial_equity=self.config.backtest.initial_equity)
             broker = BacktestBroker(self.config.backtest.fee_bps, self._slippage_bps())
-            equity_high = self.config.backtest.initial_equity
+            self._equity_high = self.config.backtest.initial_equity
             engine = StrategyEngine(self.config)  # v1: stateful engine
             self._last_engine = engine
             progress_every = int(os.environ.get("CQ_BACKTEST_PROGRESS_EVERY", "0") or 0)
@@ -459,8 +459,8 @@ class ResearchBacktester:
                     equity = portfolio.equity(prices_all)
 
                 equity_now = portfolio.equity(prices_all)
-                equity_high = max(equity_high, equity_now)
-                drawdown = equity_now / equity_high - 1 if equity_high else 0
+                self._equity_high = max(self._equity_high, equity_now)
+                drawdown = equity_now / self._equity_high - 1 if self._equity_high else 0
                 session.add(
                     EquityCurveRecord(
                         strategy_run_id=run_id,
@@ -1927,7 +1927,13 @@ class ResearchBacktester:
                 continue
 
             stop_distance = max(candidate.atr * cfg.initial_stop_atr_multiple, next_open * cfg.initial_stop_pct)
-            risk_budget = equity * cfg.trade_risk_pct * candidate.risk_multiplier
+            # v2.5G equity peak scaling: reduce risk when below peak
+            peak_ratio = equity / max(self._equity_high, 1)
+            eff_risk_pct = cfg.trade_risk_pct
+            if getattr(cfg, 'equity_peak_risk_enabled', False):
+                floor = getattr(cfg, 'equity_peak_risk_floor', 0.50)
+                eff_risk_pct *= max(floor, peak_ratio)
+            risk_budget = equity * eff_risk_pct * candidate.risk_multiplier
             full_quantity = min(
                 risk_budget / stop_distance,
                 equity * cfg.max_symbol_position_pct / next_open,
