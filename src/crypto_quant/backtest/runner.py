@@ -1864,6 +1864,9 @@ class ResearchBacktester:
             # v2.5G: hard reject vr > 30 — 0 trailing across all subsets in v2.5F
             if cfg.bad_b_vr30_reject_enabled and volume_ratio > cfg.bad_b_volume_ratio_min:
                 continue
+            # v2.5G Step 4: reject when risk_multiplier too low (RM=0.40/0.70 have 0 trailing)
+            if cfg.bad_b_low_rm_reject_enabled and risk_multiplier <= cfg.bad_b_low_rm_reject_threshold:
+                continue
             reason = f"pump_{regime}_{tier}_{sig_type}"
             candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
                 reason=reason, ret_6h=ret_6h, ret_24h=ret_24h, ret_72h=ret_72h, volume_ratio=volume_ratio,
