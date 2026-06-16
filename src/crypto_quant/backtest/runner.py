@@ -1853,6 +1853,14 @@ class ResearchBacktester:
                 and volume_ratio > cfg.bad_b_volume_ratio_min
             ):
                 risk_multiplier *= cfg.bad_b_risk_multiplier
+            if (
+                cfg.bad_b_ema_vr_risk_mid_enabled
+                and tier == "B"
+                and sig_type == "early"
+                and ema20_dev_rank_2160h >= cfg.bad_b_ema_rank_min
+                and cfg.bad_b_volume_ratio_mid_min < volume_ratio <= cfg.bad_b_volume_ratio_mid_max
+            ):
+                risk_multiplier *= cfg.bad_b_risk_multiplier_mid
             reason = f"pump_{regime}_{tier}_{sig_type}"
             candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
                 reason=reason, ret_6h=ret_6h, ret_24h=ret_24h, ret_72h=ret_72h, volume_ratio=volume_ratio,
@@ -1975,6 +1983,14 @@ class ResearchBacktester:
                                 and "confirmed" not in candidate.reason
                                 and candidate.ema20_dev_rank_2160h >= cfg.bad_b_ema_rank_min
                                 and candidate.volume_ratio > cfg.bad_b_volume_ratio_min
+                            ),
+                            "bad_b_ema_vr_risk_mid_reduced": (
+                                cfg.bad_b_ema_vr_risk_mid_enabled
+                                and candidate.tier == "B"
+                                and "early" in candidate.reason
+                                and "confirmed" not in candidate.reason
+                                and candidate.ema20_dev_rank_2160h >= cfg.bad_b_ema_rank_min
+                                and cfg.bad_b_volume_ratio_mid_min < candidate.volume_ratio <= cfg.bad_b_volume_ratio_mid_max
                             ),
                             "score": candidate.score,
                             "ret_6h": candidate.ret_6h,

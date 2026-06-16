@@ -125,6 +125,11 @@ class PumpModeConfig(BaseModel):
     bad_b_ema_rank_min: float = 0.95
     bad_b_volume_ratio_min: float = 30.0
     bad_b_risk_multiplier: float = 0.50
+    # v2.5F: mid-tier bad-B — vr 15-30 still negative but has occasional trailing
+    bad_b_ema_vr_risk_mid_enabled: bool = False
+    bad_b_volume_ratio_mid_min: float = 15.0
+    bad_b_volume_ratio_mid_max: float = 30.0
+    bad_b_risk_multiplier_mid: float = 0.75
     trailing_1_profit_pct: float = 0.60
     trailing_1_atr_multiple: float = 2.5
     trailing_2_profit_pct: float = 1.00

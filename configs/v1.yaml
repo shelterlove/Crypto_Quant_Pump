@@ -85,3 +85,4 @@ pump_mode:
   cooldown_minutes: 0
   adaptive_risk_enabled: false
   extended_cooldown_minutes: 0
+  bad_b_ema_vr_risk_mid_enabled: true
