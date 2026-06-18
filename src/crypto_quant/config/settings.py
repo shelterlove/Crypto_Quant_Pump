@@ -146,6 +146,9 @@ class PumpModeConfig(BaseModel):
     ema_abs_max_threshold: float = 40.0  # reject if ema20_dev_pct > 40%
     improved_score_enabled: bool = False  # r72 hump-shaped instead of monotonic
     reject_long_wick_enabled: bool = False  # reject when wick_ratio > 0.80
+    exit_confidence_enabled: bool = False  # confidence-tiered early exits
+    exit_confidence_wick_threshold: float = 0.80
+    exit_confidence_low_ema_threshold: float = 8.0
     # v2.5G: equity peak-ratio position scaling
     equity_peak_risk_enabled: bool = False
     equity_peak_risk_floor: float = 0.50  # minimum risk multiplier

@@ -81,6 +81,9 @@ class OpenPosition:
     confirm_entry_price: float = 0.0
     avg_entry_price: float = 0.0
     entry_notional: float = 0.0
+    v_bounce: bool = False  # h2>h1 after entry
+    ema20_dev_pct: float = 15.0  # signal-bar EMA deviation for exit tiering
+    signal_wick_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1163,6 +1166,18 @@ class ResearchBacktester:
 
         held_hours = (ensure_utc(now) - ensure_utc(position.opened_at)).total_seconds() / 3600
 
+        # Experimental, default-off: use signal-bar metadata captured at entry.
+        # Do not derive this from post-entry candles; that shifts the rule into a different time axis.
+        if getattr(cfg, "exit_confidence_enabled", False):
+            if position.signal_wick_ratio > cfg.exit_confidence_wick_threshold:
+                position.stop_mechanism = "pump_wick_kill"
+                position.stop_trigger = "pump_signal_wick_dead"
+                return "pump_wick_kill"
+            if position.ema20_dev_pct < cfg.exit_confidence_low_ema_threshold and position.probe_tier == "B":
+                position.stop_mechanism = "pump_lowconf_kill"
+                position.stop_trigger = "pump_signal_low_ema_b_tier"
+                return "pump_lowconf_kill"
+
         # v2.0: probe confirmation at 4h
         if position.is_probe and not position.probe_confirmed and held_hours >= 3.5:
             ret_4h_val = close / anchor_price - 1
@@ -2011,6 +2026,8 @@ class ResearchBacktester:
                 probe_entry_price=order.filled_price,
                 avg_entry_price=order.filled_price,
                 entry_notional=order.quantity * order.filled_price,
+                ema20_dev_pct=candidate.ema20_dev_pct,
+                signal_wick_ratio=candidate.wick_ratio,
             )
             portfolio.positions[candidate.symbol] = position
             orders.append(order)
