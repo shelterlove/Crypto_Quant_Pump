@@ -87,7 +87,6 @@ pump_mode:
   extended_cooldown_minutes: 0
   bad_b_ema_vr_risk_mid_enabled: true
   bad_b_vr30_reject_enabled: true
-  bad_b_low_rm_reject_enabled: true
   mfe_protect_enabled: true
   ema_abs_min_enabled: true
   equity_peak_risk_enabled: true

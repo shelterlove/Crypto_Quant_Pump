@@ -132,9 +132,6 @@ class PumpModeConfig(BaseModel):
     bad_b_risk_multiplier_mid: float = 0.75
     # v2.5G: hard reject when volume_ratio > 30 (0 trailing across all subsets)
     bad_b_vr30_reject_enabled: bool = False
-    # v2.5G Step 4: reject when risk_multiplier <= threshold (RM=0.40/0.70 have 0 trailing)
-    bad_b_low_rm_reject_enabled: bool = False
-    bad_b_low_rm_reject_threshold: float = 0.70
     # v2.5G Step 2: MFE-based floor on avg_entry to prevent high-MFE trades from losing
     mfe_protect_enabled: bool = False
     mfe_protect_15pct_mult: float = 1.005
@@ -146,6 +143,7 @@ class PumpModeConfig(BaseModel):
     ema_abs_max_threshold: float = 40.0  # reject if ema20_dev_pct > 40%
     improved_score_enabled: bool = False  # r72 hump-shaped instead of monotonic
     reject_long_wick_enabled: bool = False  # reject when wick_ratio > 0.80
+    reject_accel_decay_enabled: bool = False  # reject weak 6h/24h momentum with recent negative bars
     exit_confidence_enabled: bool = False  # confidence-tiered early exits
     exit_confidence_wick_threshold: float = 0.80
     exit_confidence_low_ema_threshold: float = 8.0

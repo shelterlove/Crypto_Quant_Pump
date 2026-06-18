@@ -329,7 +329,6 @@ class ResearchBacktester:
                     current_1h = {}
                     current_4h = {}
 
-                pump_scan_1h: dict[str, pd.DataFrame] = {}
                 pump_snapshot = pd.DataFrame()
                 pump_prices_all: dict[str, float] = {}
                 if self.config.pump_mode.enabled:
@@ -920,7 +919,6 @@ class ResearchBacktester:
             self._last_engine.feed_trade_result(won)
         # v20: track exit reason for adaptive risk
         if position.position_type == "pump":
-            from datetime import timedelta
             cfg_ar = self.config.pump_mode
             self._pump_recent_exits.append(reason or '?')
             lookback = getattr(cfg_ar, 'adaptive_risk_lookback', 20)
@@ -929,7 +927,9 @@ class ResearchBacktester:
             # Record post-entry price path for analysis
             post = self._compute_post_entry_path(candles_1h, symbol, position.opened_at, entry_anchor, trigger_time)
             if post:
-                post['symbol'] = symbol; post['exit_reason'] = reason; post['pnl'] = pnl
+                post['symbol'] = symbol
+                post['exit_reason'] = reason
+                post['pnl'] = pnl
                 self._pump_post_entry.append(post)
         del portfolio.positions[symbol]
         details = self._exit_details(position, current, market_state, stop_before, order.filled_price, trigger_time)
@@ -1660,19 +1660,27 @@ class ResearchBacktester:
     def _compute_post_entry_path(self, candles_1h, symbol, opened_at, entry_price, now):
         """Record 1h/2h/3h/4h post-entry performance for pump trades."""
         frame = candles_1h.get(symbol, pd.DataFrame())
-        if frame.empty: return None
+        if frame.empty:
+            return None
         opened_ts = pd.Timestamp(ensure_utc(opened_at))
         now_ts = pd.Timestamp(ensure_utc(now))
-        if 'open' not in frame.columns: return None
+        if 'open' not in frame.columns:
+            return None
         # Get candles from entry time to now
-        mask = (frame.index >= opened_ts) & (frame.index <= now_ts) if isinstance(frame.index, pd.DatetimeIndex) else (pd.to_datetime(frame['open_time'], utc=True) >= opened_ts) & (pd.to_datetime(frame['open_time'], utc=True) <= now_ts)
+        if isinstance(frame.index, pd.DatetimeIndex):
+            mask = (frame.index >= opened_ts) & (frame.index <= now_ts)
+        else:
+            open_time = pd.to_datetime(frame['open_time'], utc=True)
+            mask = (open_time >= opened_ts) & (open_time <= now_ts)
         post = frame[mask]
-        if len(post) < 1: return None
+        if len(post) < 1:
+            return None
         result = {'entry_price': float(entry_price)}
         # Track max drawdown and max favorable excursion at 1h, 2h, 3h, 4h
         for h in [1, 2, 3, 4]:
             rows = post.head(h)
-            if len(rows) == 0: break
+            if len(rows) == 0:
+                break
             high = float(rows['high'].max()) if 'high' in rows.columns else float(rows['close'].max())
             low = float(rows['low'].min()) if 'low' in rows.columns else float(rows['close'].min())
             close_h = float(rows['close'].iloc[-1]) if len(rows) > 0 else entry_price
@@ -1690,23 +1698,31 @@ class ResearchBacktester:
         new_high_count = 0
         vol_exp_count = 0
         total = 0
-        for sym, frame in candles_1h.items():
-            if len(frame) < 50: continue
+        for frame in candles_1h.values():
+            if len(frame) < 50:
+                continue
             total += 1
             r24 = float(frame['ret_24h'].iloc[-1]) if 'ret_24h' in frame.columns else float(frame['close'].iloc[-1]/frame['close'].iloc[-25]-1)
             ret_24h.append(r24)
             if 'new_12h_high' in frame.columns:
-                if bool(frame['new_12h_high'].iloc[-1]): new_high_count += 1
+                if bool(frame['new_12h_high'].iloc[-1]):
+                    new_high_count += 1
             volume = frame['volume']
             # v2.5: base volume for regime (quote vol tested separately)
             if len(volume) >= 50:
-                avg_vol = float(volume.iloc[-50:-2].mean()); recent_vol = float(volume.iloc[-6:].mean())
-                if avg_vol > 0 and recent_vol / avg_vol >= cfg.regime_hot_volume_expansion_ratio: vol_exp_count += 1
-        if total < 20: return "COLD"
+                avg_vol = float(volume.iloc[-50:-2].mean())
+                recent_vol = float(volume.iloc[-6:].mean())
+                if avg_vol > 0 and recent_vol / avg_vol >= cfg.regime_hot_volume_expansion_ratio:
+                    vol_exp_count += 1
+        if total < 20:
+            return "COLD"
         median_ret = sorted(ret_24h)[len(ret_24h)//2] if ret_24h else 0.0
-        nh_r = new_high_count / total; ve_r = vol_exp_count / total
-        if median_ret >= cfg.regime_hot_24h_return_pct and nh_r >= cfg.regime_hot_new_high_ratio and ve_r >= 0.05: return "HOT"
-        if median_ret >= cfg.regime_warm_24h_return_pct and nh_r >= cfg.regime_warm_new_high_ratio: return "WARM"
+        nh_r = new_high_count / total
+        ve_r = vol_exp_count / total
+        if median_ret >= cfg.regime_hot_24h_return_pct and nh_r >= cfg.regime_hot_new_high_ratio and ve_r >= 0.05:
+            return "HOT"
+        if median_ret >= cfg.regime_warm_24h_return_pct and nh_r >= cfg.regime_warm_new_high_ratio:
+            return "WARM"
         return "COLD"
 
     def _detect_pump_regime_snapshot(self, snapshot: pd.DataFrame) -> str:
