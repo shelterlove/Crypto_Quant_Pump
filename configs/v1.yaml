@@ -92,3 +92,6 @@ pump_mode:
   ema_abs_min_enabled: true
   equity_peak_risk_enabled: true
   equity_peak_risk_floor: 0.70
+  ema_abs_max_enabled: true
+  reject_long_wick_enabled: true
+  reject_accel_decay_enabled: true

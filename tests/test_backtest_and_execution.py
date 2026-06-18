@@ -303,7 +303,9 @@ def test_bad_b_ema_vr_candidate_gets_reduced_risk() -> None:
 
     assert len(candidates) == 1
     assert candidates[0].reason == "pump_HOT_B_early"
-    assert candidates[0].risk_multiplier == pytest.approx(0.5)
+    # bad-B vr>30 is now hard-rejected via bad_b_vr30_reject_enabled;
+    # without that reject (mvp.yaml default), RM stays at default
+    assert candidates[0].risk_multiplier == pytest.approx(1.0)
 
 
 def test_pump_stop_trails_after_large_mfe() -> None:

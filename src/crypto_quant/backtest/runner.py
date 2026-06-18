@@ -98,6 +98,14 @@ class PumpCandidate:
     quote_volume_24h: float
     tier: str = "B"  # v2.0: "A" | "B" signal quality
     ema20_dev_rank_2160h: float = 0.0
+    # Signal-bar metadata (for post-trade analysis without DB joins)
+    ema20_dev_pct: float = 0.0
+    wick_ratio: float = 0.0
+    r1: float = 0.0
+    r2: float = 0.0
+    r3: float = 0.0
+    pos24h: float = 0.0
+    vol_trend6: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -608,7 +616,7 @@ class ResearchBacktester:
             "close", "volume", "ret_24h", "ret_6h", "ret_72h", "above_ma20",
             "qv_6h_sum", "qv_24h_sum", "qv_30_avg", "wick_ratio",
             "new_12h_high", "regime_vol_expansion", "atr14", "ema20_dev_rank_2160h",
-            "ema20_dev",
+            "ema20_dev", "r1", "r2", "r3", "pos24h", "vol_trend6",
         ]
         cache: dict[str, dict[str, np.ndarray]] = {}
         for symbol, frame in candles_1h.items():
@@ -687,6 +695,11 @@ class ResearchBacktester:
                     "atr": float(values["atr14"][idx]),
                     "ema20_dev_rank_2160h": float(values["ema20_dev_rank_2160h"][idx]),
                     "ema20_dev": float(values["ema20_dev"][idx]),
+                    "r1": float(values["r1"][idx]),
+                    "r2": float(values["r2"][idx]),
+                    "r3": float(values["r3"][idx]),
+                    "pos24h": float(values["pos24h"][idx]),
+                    "vol_trend6": float(values["vol_trend6"][idx]),
                 }
             )
         return pd.DataFrame(rows)
@@ -1340,12 +1353,20 @@ class ResearchBacktester:
         vol_cfg = self.config.volume_score
         trend_cfg = self.config.trend
         for sym, frame in candles_1h.items():
-            if frame.empty or len(frame) <= min_window:
+            if frame.empty:
                 continue
             close = frame["close"].astype(float)
             high = frame["high"].astype(float)
             low = frame["low"].astype(float)
             volume = frame["volume"].astype(float)
+            # Lightweight columns computed unconditionally (needed for snapshot cache)
+            frame["pos24h"] = close / high.rolling(24, min_periods=1).max() - 1
+            frame["vol_trend6"] = volume / volume.rolling(6, min_periods=1).mean()
+            frame["r1"] = close.pct_change(1)
+            frame["r2"] = close.pct_change(2)
+            frame["r3"] = close.pct_change(3)
+            if len(frame) <= min_window:
+                continue
             # Momentum
             weighted_return = pd.Series(0.0, index=frame.index)
             for window, weight in zip(windows, weights, strict=True):
@@ -1825,6 +1846,10 @@ class ResearchBacktester:
                 continue
             if float(row.wick_ratio) >= self.config.risk.blowoff_wick_ratio and bool(row.new_12h_high):
                 continue
+            # v2.5G: reject long wick + 2h negative return
+            if getattr(cfg, 'reject_long_wick_enabled', False):
+                if float(row.wick_ratio) > 0.80 and float(row.r2) < 0:
+                    continue
             min_6h = getattr(cfg, "min_6h_return", 0.0)
             if ret_6h < min_6h:
                 continue
@@ -1838,18 +1863,18 @@ class ResearchBacktester:
             signal_ok = ((confirmed_sig or early) and regime == "HOT") or (warm_early_ok and regime == "WARM")
             if not signal_ok:
                 continue
+            # r72 overheating: hard reject > 80% (0 trailing in v2.5F)
+            if ret_72h > cfg.max_72h_return_full_risk:
+                continue
             if ret_72h > cfg.max_72h_return_chase:
                 continue
             if ret_72h > cfg.max_72h_return_entry:
                 continue
             if ret_72h > 1.20 and ret_6h / max(ret_24h, 0.001) < 0.30:
                 continue
+            # only remaining RM modifiers: early_confirmed bonus, bad-B mid
             risk_multiplier = 1.0
-            if ret_72h > cfg.max_72h_return_reduced_risk:
-                risk_multiplier = cfg.late_chase_risk_multiplier
-            elif ret_72h > cfg.max_72h_return_full_risk:
-                risk_multiplier = cfg.reduced_risk_multiplier
-            if early and confirmed_sig and ret_72h <= cfg.max_72h_return_full_risk:
+            if early and confirmed_sig:
                 risk_multiplier *= 1.25
             atr = float(row.atr)
             if pd.isna(atr) or atr <= 0:
@@ -1858,19 +1883,22 @@ class ResearchBacktester:
             tier = "A" if (regime == "WARM" and (early or warm_early_ok) and 0.45 <= ret_72h <= 0.86 and volume_ratio <= 15) else "B"
             sig_type = "early_confirmed" if (early and confirmed_sig) else ("early" if early else "confirmed")
             ema20_dev_rank_2160h = float(row.ema20_dev_rank_2160h)
-            # v2.5G abs EMA filter: reject weak absolute deviation
+            # v2.5G abs EMA filter: lower + upper bounds
             if getattr(cfg, 'ema_abs_min_enabled', False):
-                ema_abs = float(getattr(row, 'ema20_dev', 0)) * 100  # ratio → percentage
+                ema_abs = float(getattr(row, 'ema20_dev', 0)) * 100
                 if ema_abs < cfg.ema_abs_min_threshold:
                     continue
-            if (
-                cfg.bad_b_ema_vr_risk_enabled
-                and tier == "B"
-                and sig_type == "early"
-                and ema20_dev_rank_2160h >= cfg.bad_b_ema_rank_min
-                and volume_ratio > cfg.bad_b_volume_ratio_min
-            ):
-                risk_multiplier *= cfg.bad_b_risk_multiplier
+                if getattr(cfg, 'ema_abs_max_enabled', False) and ema_abs > cfg.ema_abs_max_threshold:
+                    continue
+            # v2.5G: reject weak momentum + all-recent-negative
+            if getattr(cfg, 'reject_accel_decay_enabled', False):
+                r1 = float(getattr(row, 'r1', 0))
+                r2 = float(getattr(row, 'r2', 0))
+                r3 = float(getattr(row, 'r3', 0))
+                if ret_6h / max(ret_24h, 0.001) < 0.5 and r1 < 0 and r2 < 0 and r3 < 0:
+                    continue
+            # bad-B vr>30: hard reject (0 trailing, handled by vr30_reject)
+            # bad-B vr 15-30: risk × 0.75 (v2.5F, >0 surviving trailing)
             if (
                 cfg.bad_b_ema_vr_risk_mid_enabled
                 and tier == "B"
@@ -1879,16 +1907,17 @@ class ResearchBacktester:
                 and cfg.bad_b_volume_ratio_mid_min < volume_ratio <= cfg.bad_b_volume_ratio_mid_max
             ):
                 risk_multiplier *= cfg.bad_b_risk_multiplier_mid
-            # v2.5G: hard reject vr > 30 — 0 trailing across all subsets in v2.5F
+            # v2.5G: hard reject vr > 30
             if cfg.bad_b_vr30_reject_enabled and volume_ratio > cfg.bad_b_volume_ratio_min:
-                continue
-            # v2.5G Step 4: reject when risk_multiplier too low (RM=0.40/0.70 have 0 trailing)
-            if cfg.bad_b_low_rm_reject_enabled and risk_multiplier <= cfg.bad_b_low_rm_reject_threshold:
                 continue
             reason = f"pump_{regime}_{tier}_{sig_type}"
             candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
                 reason=reason, ret_6h=ret_6h, ret_24h=ret_24h, ret_72h=ret_72h, volume_ratio=volume_ratio,
-                quote_volume_24h=quote_volume_24h, tier=tier, ema20_dev_rank_2160h=ema20_dev_rank_2160h))
+                quote_volume_24h=quote_volume_24h, tier=tier, ema20_dev_rank_2160h=ema20_dev_rank_2160h,
+                ema20_dev_pct=float(getattr(row, 'ema20_dev', 0)) * 100,
+                wick_ratio=float(row.wick_ratio), r1=float(getattr(row, 'r1', 0)),
+                r2=float(getattr(row, 'r2', 0)), r3=float(getattr(row, 'r3', 0)),
+                pos24h=float(getattr(row, 'pos24h', 0)), vol_trend6=float(getattr(row, 'vol_trend6', 0))))
         return sorted(candidates, key=lambda item: item.score, reverse=True)
 
     def _enter_pump_positions(
@@ -2028,6 +2057,10 @@ class ResearchBacktester:
                             "ret_72h": candidate.ret_72h,
                             "volume_ratio": candidate.volume_ratio,
                             "quote_volume_24h": candidate.quote_volume_24h,
+                            "ema20_dev_pct": candidate.ema20_dev_pct,
+                            "wick_ratio": candidate.wick_ratio,
+                            "r1": candidate.r1, "r2": candidate.r2, "r3": candidate.r3,
+                            "pos24h": candidate.pos24h, "vol_trend6": candidate.vol_trend6,
                         },
                     )
                 ],
