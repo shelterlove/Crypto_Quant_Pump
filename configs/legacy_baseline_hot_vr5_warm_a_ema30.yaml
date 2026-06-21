@@ -1,0 +1,2 @@
+extends: configs/candidate_hot_vr5_warm_a_ema30.yaml
+strategy_version: pump-v1-legacy-base

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-import os
 from pathlib import Path
-import time
 
 import numpy as np
 import pandas as pd
@@ -12,31 +12,18 @@ from sqlalchemy.orm import Session
 
 from crypto_quant.config.settings import AppConfig
 from crypto_quant.execution.broker import BacktestBroker, Order
-from crypto_quant.factors.momentum import MomentumFactorEngine, compute_atr
-from crypto_quant.risk.engine import RiskEngine
-from crypto_quant.risk.market_state import (
-    MarketState,
-    compute_market_breadth,
-    evaluate_btc_ma50_state,
-    fast_risk_valve_triggered,
-)
+from crypto_quant.risk.market_state import MarketState, fast_risk_valve_triggered
 from crypto_quant.storage.candles import distinct_candle_symbols, load_candles
 from crypto_quant.storage.models import (
     EquityCurveRecord,
-    FactorScoreRecord,
-    MarketStateRecord,
     OrderRecord,
     PositionRecord,
     RejectedSignalRecord,
-    SignalRecord,
     StrategyRun,
 )
-from crypto_quant.strategy.engine import StrategyEngine
-from crypto_quant.strategy.types import SwapRecommendation, TargetPosition
-from crypto_quant.universe.service import WeeklyUniverseService
-from crypto_quant.utils.time import ensure_utc, monday_utc
+from crypto_quant.utils.time import ensure_utc
 
-# Max bars needed by any factor: momentum 73 + MA trend 20 + vol avg 20 + buffer
+# Max bars needed by the pump indicators plus a small buffer.
 _SLICE_TAIL_BARS = 200
 # Batch DB flushes: only flush every N iterations to reduce round-trips
 _DB_FLUSH_EVERY = 100
@@ -63,27 +50,27 @@ class OpenPosition:
     stop_mechanism: str = "initial_atr_stop"
     stop_trigger: str = "low_below_initial_atr_stop"
     last_stop_update: dict[str, object] = field(default_factory=dict)
-    # v1: position state machine
-    state: str = "strong"  # "strong" | "weakening" | "failed"
-    weakened: bool = False  # True after first partial reduction
-    entry_atr: float = 0.0  # ATR at entry time, for expansion tracking (§7.6-7.7)
-    entry_vr: float = 0.0   # v28: volume ratio at entry, for post-entry tightening
-    position_type: str = "main"  # "main" | "pump"
     max_favorable_pct: float = 0.0
-    # v2.0: probe-and-confirm position sizing
-    is_probe: bool = False           # True if position is a partial probe
-    probe_full_qty: float = 0.0      # intended full position size
-    probe_tier: str = ""             # "A" | "B" — signal quality at entry
-    probe_confirmed: bool = False    # True after 4h confirmation add
-    probe_add_qty: float = 0.0       # pending scale-in quantity
-    entry_vr: float = 0.0            # volume ratio at entry
+    is_probe: bool = False
+    probe_full_qty: float = 0.0
+    probe_tier: str = ""
+    probe_confirmed: bool = False
+    probe_stage: int = 0
+    probe_add_qty: float = 0.0
     probe_entry_price: float = 0.0
     confirm_entry_price: float = 0.0
     avg_entry_price: float = 0.0
     entry_notional: float = 0.0
+    core_qty: float = 0.0
+    add_qty: float = 0.0
+    add_entry_price: float = 0.0
+    add_opened_at: datetime | None = None
+    add_highest_price: float = 0.0
     v_bounce: bool = False  # h2>h1 after entry
     ema20_dev_pct: float = 15.0  # signal-bar EMA deviation for exit tiering
     signal_wick_ratio: float = 0.0
+    market_phase: str = "normal"
+    exit_profile: str = "normal"
 
 
 @dataclass(frozen=True)
@@ -99,7 +86,7 @@ class PumpCandidate:
     ret_72h: float
     volume_ratio: float
     quote_volume_24h: float
-    tier: str = "B"  # v2.0: "A" | "B" signal quality
+    tier: str = "B"
     ema20_dev_rank_2160h: float = 0.0
     # Signal-bar metadata (for post-trade analysis without DB joins)
     ema20_dev_pct: float = 0.0
@@ -122,7 +109,6 @@ class OrderMetadata:
 class Portfolio:
     cash: float
     positions: dict[str, OpenPosition] = field(default_factory=dict)
-    # v1: risk tracking
     daily_realized_loss: float = 0.0
     recent_trade_results: list[bool] = field(default_factory=list)
     pump_trade_results: list[bool] = field(default_factory=list)
@@ -144,16 +130,14 @@ class Portfolio:
             self.daily_realized_loss = 0.0
             self.last_date = today
 
-    def record_trade(self, pnl: float, won: bool, position_type: str = "main") -> None:
+    def record_trade(self, pnl: float, won: bool) -> None:
         """Record a closed trade's PnL and outcome."""
         if pnl < 0:
             self.daily_realized_loss += pnl
-        if position_type == "pump":
-            self.pump_trade_results.append(won)
-            if len(self.pump_trade_results) > 20:
-                self.pump_trade_results = self.pump_trade_results[-20:]
+        self.pump_trade_results.append(won)
+        if len(self.pump_trade_results) > 20:
+            self.pump_trade_results = self.pump_trade_results[-20:]
         self.recent_trade_results.append(won)
-        # keep only last 20 results
         if len(self.recent_trade_results) > 20:
             self.recent_trade_results = self.recent_trade_results[-20:]
 
@@ -161,50 +145,21 @@ class Portfolio:
 @dataclass
 class ResearchBacktester:
     config: AppConfig
-    _last_engine: StrategyEngine | None = None
     _pos_cache_1h: dict[str, dict[pd.Timestamp, int]] = field(default_factory=dict)
-    _pos_cache_4h: dict[str, dict[pd.Timestamp, int]] = field(default_factory=dict)
     _pump_cooldown_until: datetime = field(default_factory=lambda: datetime(2000, 1, 1, tzinfo=UTC))
     _pump_regime: str = "COLD"  # HOT | WARM | COLD
     _last_regime_check: datetime = field(default_factory=lambda: datetime(2000, 1, 1, tzinfo=UTC))
     _pump_consecutive_losses: int = 0
     _pump_symbol_cooldowns: dict[str, datetime] = field(default_factory=dict)  # per-symbol re-entry cooldown
+    _pump_symbol_last_exit: dict[str, tuple[datetime, str]] = field(default_factory=dict)
     _pump_post_entry: list[dict[str, object]] = field(default_factory=list)  # post-entry price paths
-    _pump_recent_exits: list[str] = field(default_factory=list)  # v20: adaptive risk tracking
-    _candles_ref: dict[str, pd.DataFrame] = field(default_factory=dict)  # v2.5: full candles ref for enrichment
+    _pump_recent_exits: list[str] = field(default_factory=list)
+    _candles_ref: dict[str, pd.DataFrame] = field(default_factory=dict)
     _snapshot_cache_1h: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
-
-    def run_synthetic(self, session: Session | None = None) -> BacktestResult:
-        run_id = self._create_run(session, "synthetic-mvp") if session is not None else None
-        candles = self._synthetic_candles()
-        factors = MomentumFactorEngine(self.config.momentum).score(candles)
-        prices = {symbol: float(frame["close"].iloc[-1]) for symbol, frame in candles.items()}
-        atrs = {symbol: float(compute_atr(frame, self.config.risk.atr_period).iloc[-1]) for symbol, frame in candles.items()}
-        market = MarketState("risk_on", reasons=["synthetic_acceptance"])
-        _, targets, _ = StrategyEngine(self.config).generate_targets(
-            factors,
-            market,
-            prices,
-            atrs,
-            self.config.backtest.initial_equity,
-            candles,
-        )
-        broker = BacktestBroker(self.config.backtest.fee_bps, self.config.backtest.slippage_bps)
-        orders = [
-            broker.execute_market(target.symbol, "buy", target.quantity, target.entry_price, "next_open_fill")
-            for target in targets
-        ]
-        final_equity = self.config.backtest.initial_equity - sum(order.fee for order in orders)
-        if session is not None and run_id is not None:
-            self._write_orders(
-                session,
-                run_id,
-                datetime.now(UTC),
-                orders,
-                [OrderMetadata(mechanism="entry", trigger="synthetic") for _ in orders],
-            )
-            self._finish_run(session, run_id, "completed")
-        return BacktestResult(run_id, orders, final_equity)
+    _equity_high: float = 0.0
+    _market_feature_history: list[dict[str, float]] = field(default_factory=list)
+    _market_context: MarketState = field(default_factory=lambda: MarketState("risk_on"))
+    _previous_market_phase: str = "normal"
 
     def run_real(
         self,
@@ -215,49 +170,32 @@ class ResearchBacktester:
     ) -> BacktestResult:
         start = ensure_utc(start)
         end = ensure_utc(end)
-        run_id = self._create_run(session, "real-mvp")
+        run_id = self._create_run(session, "pump")
         if run_id is None:
             raise RuntimeError("real backtest requires a database session")
         orders: list[Order] = []
         try:
-            universe_map = WeeklyUniverseService(self.config).load_effective_map(session, start, end)
-            all_universe = sorted(
-                {symbol for symbols in universe_map.values() for symbol in symbols}
+            if not self.config.pump_mode.enabled:
+                raise RuntimeError("pump-only backtester requires pump_mode.enabled=true")
+
+            all_symbols = sorted(
+                set(distinct_candle_symbols(session, self.config.exchange_id, "1h"))
                 | {self.config.market_state.btc_symbol}
             )
-            if self.config.pump_mode.enabled:
-                all_symbols = sorted(
-                    set(distinct_candle_symbols(session, self.config.exchange_id, "1h"))
-                    | {self.config.market_state.btc_symbol}
-                )
-            else:
-                all_symbols = all_universe
             candles_1h = self._prepare_candles(load_candles(session, self.config.exchange_id, all_symbols, "1h", start, end))
             self._candles_ref = candles_1h  # for on-demand enrichment in _pump_candidates
-            candles_4h = self._prepare_candles(load_candles(session, self.config.exchange_id, all_symbols, "4h", start, end))
             btc_1h = candles_1h.get(self.config.market_state.btc_symbol, pd.DataFrame())
-            btc_4h_required = candles_4h.get(self.config.market_state.btc_symbol, pd.DataFrame())
-            if btc_1h.empty or btc_4h_required.empty:
-                missing = []
-                if btc_1h.empty:
-                    missing.append("1h")
-                if btc_4h_required.empty:
-                    missing.append("4h")
-                raise RuntimeError(f"missing required BTC/USDT candles for backtest: {', '.join(missing)}")
+            if btc_1h.empty:
+                raise RuntimeError("missing required BTC/USDT 1h candles for backtest")
             timeline = self._timeline(candles_1h, start, end)
             if not timeline:
                 raise RuntimeError("no 1h candles available for backtest timeline")
-            # Pre-build position cache: map (symbol, timestamp) → integer row position
             self._pos_cache_1h = self._build_position_cache(candles_1h, timeline)
-            self._pos_cache_4h = self._build_position_cache(candles_4h, timeline)
-            # Pre-compute all factor columns once on full DataFrames
-            self._precompute_indicators(candles_1h, candles_4h)
+            self._precompute_indicators(candles_1h)
             self._snapshot_cache_1h = self._build_snapshot_value_cache(candles_1h)
             portfolio = Portfolio(cash=self.config.backtest.initial_equity, initial_equity=self.config.backtest.initial_equity)
             broker = BacktestBroker(self.config.backtest.fee_bps, self._slippage_bps())
             self._equity_high = self.config.backtest.initial_equity
-            engine = StrategyEngine(self.config)  # v1: stateful engine
-            self._last_engine = engine
             progress_every = int(os.environ.get("CQ_BACKTEST_PROGRESS_EVERY", "0") or 0)
             progress_started = time.perf_counter()
             progress_total = max(len(timeline) - 1, 1)
@@ -277,196 +215,80 @@ class ResearchBacktester:
                 next_time = timeline[i + 1]
                 portfolio.reset_daily_loss(now)
 
-                active_symbols = [] if self.config.pump_mode.enabled else universe_map.get(monday_utc(now), [])
-                if not self.config.pump_mode.enabled:
-                    # Grace period: keep coins that were in the universe last week
-                    prev_week = monday_utc(now) - timedelta(days=7)
-                    prev_symbols = universe_map.get(prev_week, [])
-                    active_symbols = sorted(set(active_symbols) | set(prev_symbols))
-
-                # Filter mega-cap and excluded coins from trading universe.
-                # BTC is still kept for market state monitoring via btc_symbol config.
                 mega_caps = {c.upper() for c in self.config.universe.mega_cap_exclude}
                 keywords = [kw.upper() for kw in self.config.universe.exclude_keywords]
-                active_symbols = [
-                    s for s in active_symbols
-                    if s.split("/")[0].upper() not in mega_caps
-                    and not any(kw in s.split("/")[0].upper() for kw in keywords)
-                ]
-                # Momentum watchlist: extreme momentum coins bypass pool volume threshold.
-                # Scan ALL loaded candles, not just universe symbols.
-                all_spot = [] if self.config.pump_mode.enabled else [s for s in candles_1h.keys() if s not in active_symbols
-                           and s.split('/')[0].upper() not in mega_caps
-                           and not any(kw in s.split('/')[0].upper() for kw in keywords)
-                           and s != self.config.market_state.btc_symbol]
-                if all_spot:
-                    watch_1h = self._slice(candles_1h, all_spot, now, cache=self._pos_cache_1h)
-                    for sym, frame in watch_1h.items():
-                        if len(frame) < 73:
-                            continue
-                        # v20: use precomputed weighted_return
-                        if "weighted_return" in frame.columns:
-                            wret = float(frame["weighted_return"].iloc[-1])
-                        else:
-                            close = frame['close'].astype(float)
-                            wret = (float(close.iloc[-1]/close.iloc[-5]-1)*0.25 +
-                                    float(close.iloc[-1]/close.iloc[-25]-1)*0.35 +
-                                    float(close.iloc[-1]/close.iloc[-49]-1)*0.25 +
-                                    float(close.iloc[-1]/close.iloc[-73]-1)*0.15)
-                        if wret >= 0.50:
-                            active_symbols.append(sym)
-                    active_symbols = sorted(set(active_symbols))
-                # Always include held symbols for position management even if
-                # they dropped out of the universe this week (white paper §2.4).
                 held_symbols = list(portfolio.positions.keys())
-                all_relevant = sorted(set(active_symbols) | set(held_symbols))
+                all_relevant = sorted(set(held_symbols))
 
                 if all_relevant:
                     current_1h = self._slice(candles_1h, all_relevant, now, cache=self._pos_cache_1h)
-                    # v2.5: 4h slice only needed for main strategy (market state / breadth)
-                    current_4h = {} if self.config.pump_mode.enabled else self._slice(candles_4h, all_relevant, now, cache=self._pos_cache_4h)
                 else:
                     current_1h = {}
-                    current_4h = {}
 
-                pump_snapshot = pd.DataFrame()
-                pump_prices_all: dict[str, float] = {}
-                if self.config.pump_mode.enabled:
-                    pump_symbols = [
-                        s for s in all_symbols
-                        if s != self.config.market_state.btc_symbol
-                        and s.split("/")[0].upper() not in mega_caps
-                        and not any(kw in s.split("/")[0].upper() for kw in keywords)
-                    ]
-                    pump_snapshot = self._pump_snapshot(candles_1h, pump_symbols, now)
-                    pump_prices_all = self._pump_latest_prices(candles_1h, pump_symbols, now)
+                pump_symbols = [
+                    s for s in all_symbols
+                    if s != self.config.market_state.btc_symbol
+                    and s.split("/")[0].upper() not in mega_caps
+                    and not any(kw in s.split("/")[0].upper() for kw in keywords)
+                ]
+                pump_snapshot = self._pump_snapshot(candles_1h, pump_symbols, now)
+                pump_prices_all = self._pump_latest_prices(candles_1h, pump_symbols, now)
 
-                # v2.5: fast path for pump-only — skip market breadth, keep fast_risk_valve
-                if self.config.pump_mode.enabled:
-                    current_btc_1h = self._slice(candles_1h, [self.config.market_state.btc_symbol], now, cache=self._pos_cache_1h).get(self.config.market_state.btc_symbol, pd.DataFrame())
-                    fv, _ = fast_risk_valve_triggered(btc_1h=current_btc_1h)
-                    market = MarketState("defensive" if fv else "risk_on", fast_risk_valve=fv, reasons=["pump_mode_fast"])
-                else:
-                    btc_4h = self._slice(candles_4h, [self.config.market_state.btc_symbol], now, cache=self._pos_cache_4h).get(
-                        self.config.market_state.btc_symbol, pd.DataFrame())
-                    current_btc_1h = self._slice(candles_1h, [self.config.market_state.btc_symbol], now, cache=self._pos_cache_1h).get(
-                        self.config.market_state.btc_symbol, pd.DataFrame())
-                    market = self._market_state(btc_4h, current_4h, current_btc_1h)
+                current_btc_1h = self._slice(
+                    candles_1h,
+                    [self.config.market_state.btc_symbol],
+                    now,
+                    cache=self._pos_cache_1h,
+                ).get(self.config.market_state.btc_symbol, pd.DataFrame())
+                fast_valve, fast_reasons = fast_risk_valve_triggered(btc_1h=current_btc_1h)
+                if (now - self._last_regime_check).total_seconds() >= 14400:
+                    self._pump_regime = self._detect_pump_regime_snapshot(pump_snapshot)
+                    self._market_context = self._detect_market_context(pump_snapshot, current_btc_1h, fast_valve, fast_reasons)
+                    self._last_regime_check = now
+                market = self._market_context
+                if fast_valve and not market.fast_risk_valve:
+                    market = MarketState(
+                        "risk_off",
+                        fast_risk_valve=True,
+                        reasons=fast_reasons or ["btc_fast_valve"],
+                        phase="risk_off",
+                        transition="deteriorating",
+                        risk_multiplier=0.0,
+                        entry_mode="none",
+                        exit_profile="aggressive_tighten" if self.config.pump_mode.market_context_exit_tightening_enabled else "normal",
+                        metrics=market.metrics,
+                    )
                 prices_all = self._last_prices(current_1h)
 
-                # ---- compute factor scores early (needed for position state rank check) ----
-                factors = pd.DataFrame()
-                if active_symbols:
-                    # Filter from already-sliced current_* (active ⊆ all_relevant)
-                    active_1h = {s: current_1h[s] for s in active_symbols if s in current_1h}
-                    active_4h = {s: current_4h[s] for s in active_symbols if s in current_4h}
-                    factors = self._fast_factors(active_1h)
+                self._process_stops(session, run_id, now, next_time, portfolio, candles_1h, broker, orders, market)
 
-                # ---- always run position management ----
-                # Pass factor scores so position state can check ranking
-                self._update_position_states(portfolio, current_1h, now, factors=factors)
-
-                for symbol, position in list(portfolio.positions.items()):
-                    if position.position_type == "main" and position.state == "weakening" and not position.weakened:
-                        self._weakening_reduce(
-                            session, run_id, now, next_time, symbol, position,
-                            portfolio, candles_1h, broker, orders,
-                        )
-
-                # v1: check hard risk limits on held positions (§7.7)
-                for symbol, position in list(portfolio.positions.items()):
-                    if position.position_type != "main":
-                        continue
-                    current_atr = self._latest_atr(current_1h.get(symbol))
-                    if self._check_hard_risk_limits(position, portfolio, prices_all, current_atr=current_atr):
-                        position.state = "weakening"  # force weakening → will reduce or exit
-
-                self._process_stops(session, run_id, now, next_time, portfolio, candles_1h, broker, orders, market, engine)
-
-                # v2.5: detect pump regime from sliced candles, scan candidates if HOT/WARM
                 pump_candidates: list = []
                 pump_prices: dict[str, float] = {}
-                if self.config.pump_mode.enabled and (not pump_snapshot.empty or pump_prices_all):
-                    if now >= self._pump_cooldown_until:
-                        if not hasattr(self, '_last_regime_check') or (now - self._last_regime_check).total_seconds() >= 14400:
-                            self._pump_regime = self._detect_pump_regime_snapshot(pump_snapshot)
-                            self._last_regime_check = now
-                        if self._pump_regime in ("HOT", "WARM"):
-                            pump_prices = pump_prices_all
-                            pump_equity = portfolio.equity({**prices_all, **pump_prices})
-                            pump_candidates = self._pump_candidates_from_snapshot(pump_snapshot, portfolio, pump_equity, now)
-                    self._enter_pump_positions(
-                        session,
-                        run_id,
-                        now,
-                        next_time,
-                        pump_candidates,
-                        portfolio,
-                        candles_1h,
-                        broker,
-                        orders,
-                        {**prices_all, **pump_prices},
-                    )
-
-                # ---- signal generation (only when universe is active; skip if pump-only mode) ----
-                if active_symbols and not self.config.pump_mode.enabled:
-                    prices_active = self._last_prices(active_1h)
-
-                    equity = portfolio.equity(prices_all)
-                    self._write_market_state(session, run_id, now, market)
-                    self._write_factor_scores(session, run_id, now, factors)
-                    atrs = {
-                        symbol: float(compute_atr(frame, self.config.risk.atr_period).iloc[-1])
-                        for symbol, frame in active_1h.items()
-                        if len(frame) >= self.config.risk.atr_period + 1
-                    }
-
-                    signals, targets, rejected = engine.generate_targets(
-                        factors,
-                        market,
-                        prices_active,
-                        atrs,
-                        equity,
-                        active_1h,
-                        candles_4h=active_4h,
-                        now=now,
-                        daily_realized_loss=portfolio.daily_realized_loss,
-                        recent_trade_results=portfolio.recent_trade_results,
-                    )
-                    engine.update_false_breakout(factors, now=now)
-
-                    for signal in signals:
-                        session.add(
-                            SignalRecord(
-                                strategy_run_id=run_id,
-                                time=now,
-                                symbol=signal.symbol,
-                                side=signal.side,
-                                rank=signal.rank,
-                                target_weight=signal.target_weight,
-                                reason=signal.reason,
-                            )
-                        )
-                    for symbol, reason in rejected:
-                        self._reject(session, run_id, now, symbol, reason)
-                    # --- swap mechanism (White Paper §10) ---
-                    swaps = self._find_swaps(portfolio, targets, factors) if self.config.risk.swap_enabled else []
-                    for swap in swaps:
-                        # Sell the weak position and buy the stronger one
-                        old_pos = portfolio.positions.get(swap.sell_symbol)
-                        if old_pos is not None:
-                            self._full_exit(
-                                session, run_id, next_time, swap.sell_symbol, old_pos,
-                                portfolio, candles_1h, broker, orders, market, old_pos.stop_price,
-                                f"swap_out_to_{swap.buy_target.symbol}", now,
-                            )
-
-                    approved = RiskEngine(self.config.risk).approve_targets(
-                        [target for target in targets if target.symbol not in portfolio.positions]
-                    ).approved
-                    self._enter_positions(session, run_id, now, next_time, approved, portfolio, candles_1h, broker, orders)
-                else:
-                    equity = portfolio.equity(prices_all)
+                if (
+                    (not market.fast_risk_valve)
+                    and market.entry_mode != "none"
+                    and (not pump_snapshot.empty or pump_prices_all)
+                    and now >= self._pump_cooldown_until
+                ):
+                    if self._pump_regime in ("HOT", "WARM") or (
+                        self._pump_regime == "COLD" and self.config.pump_mode.cold_squeeze_enabled
+                    ):
+                        pump_prices = pump_prices_all
+                        pump_equity = portfolio.equity({**prices_all, **pump_prices})
+                        pump_candidates = self._pump_candidates_from_snapshot(pump_snapshot, portfolio, pump_equity, now)
+                self._enter_pump_positions(
+                    session,
+                    run_id,
+                    now,
+                    next_time,
+                    pump_candidates,
+                    portfolio,
+                    candles_1h,
+                    broker,
+                    orders,
+                    {**prices_all, **pump_prices},
+                    market,
+                )
 
                 equity_now = portfolio.equity(prices_all)
                 self._equity_high = max(self._equity_high, equity_now)
@@ -584,15 +406,18 @@ class ResearchBacktester:
         cache = self._pos_cache_1h
         for sym in symbols:
             frame = candles.get(sym)
-            if frame is None or frame.empty: continue
+            if frame is None or frame.empty:
+                continue
             if sym in cache:
                 pos = cache[sym].get(end_ts)
-                if pos is None or int(pos) < 73: continue
+                if pos is None or int(pos) < 73:
+                    continue
                 idx = int(pos) - 1
             else:
                 try:
                     idx = frame.index.get_loc(end_ts) - 1
-                    if idx < 72: continue
+                    if idx < 72:
+                        continue
                 except (KeyError, IndexError):
                     continue
             row = {'symbol': sym, 'price': float(frame['close'].iloc[idx]),
@@ -711,7 +536,7 @@ class ResearchBacktester:
 
     @staticmethod
     def _trade_entry_price(position: OpenPosition) -> float:
-        return position.avg_entry_price if position.position_type == "pump" and position.avg_entry_price > 0 else position.entry_price
+        return position.avg_entry_price if position.avg_entry_price > 0 else position.entry_price
 
     @staticmethod
     def _trade_entry_notional(position: OpenPosition) -> float:
@@ -720,48 +545,11 @@ class ResearchBacktester:
     def _pump_stop_anchor_price(self, position: OpenPosition) -> float:
         if (
             self.config.pump_mode.probe_anchor_breathing_enabled
-            and position.position_type == "pump"
             and position.probe_confirmed
             and position.probe_entry_price > 0
         ):
             return position.probe_entry_price
         return self._trade_entry_price(position)
-
-    def _market_state(
-        self,
-        btc_4h: pd.DataFrame,
-        candles_4h: dict[str, pd.DataFrame],
-        btc_1h: pd.DataFrame | None = None,
-    ) -> MarketState:
-        state = evaluate_btc_ma50_state(btc_4h, self.config.market_state)
-        breadth = compute_market_breadth(candles_4h, ma_period=20)
-        reasons = list(state.reasons)
-        fast_triggered, fast_reasons = fast_risk_valve_triggered(btc_1h=btc_1h)
-        reasons.extend(fast_reasons)
-        if fast_triggered:
-            return MarketState(
-                "defensive",
-                state.btc_close,
-                state.btc_ma50,
-                state.ma50_slope_4,
-                breadth,
-                fast_risk_valve=True,
-                reasons=reasons,
-            )
-        if breadth < 0.2:
-            return MarketState(
-                "defensive",
-                state.btc_close,
-                state.btc_ma50,
-                state.ma50_slope_4,
-                breadth,
-                reasons=reasons + ["breadth_emergency"],
-            )
-        if breadth < 0.25:
-            return MarketState("caution", state.btc_close, state.btc_ma50, state.ma50_slope_4, breadth, reasons=reasons + ["breadth_pause"])
-        if breadth < 0.35:
-            return MarketState("caution", state.btc_close, state.btc_ma50, state.ma50_slope_4, breadth, reasons=reasons + ["breadth_weak"])
-        return MarketState(state.state, state.btc_close, state.btc_ma50, state.ma50_slope_4, breadth, state.fast_risk_valve, reasons)
 
     def _process_stops(
         self,
@@ -774,8 +562,8 @@ class ResearchBacktester:
         broker: BacktestBroker,
         orders: list[Order],
         market_state: MarketState,
-        engine: StrategyEngine,
     ) -> None:
+        cfg = self.config.pump_mode
         for symbol, position in list(portfolio.positions.items()):
             frame = candles_1h.get(symbol, pd.DataFrame())
             current = self._slice_frame(frame, now) if not frame.empty else pd.DataFrame()
@@ -783,58 +571,87 @@ class ResearchBacktester:
                 continue
 
             stop_before = position.stop_price
-            if position.position_type == "pump":
-                forced_reason = self._update_pump_stop(position, current, now)
-                if forced_reason == "probe_confirm":
-                    # v2.0: scale-in to full position
-                    add_qty = position.probe_add_qty
-                    next_open = self._next_open(candles_1h, symbol, next_time)
-                    if add_qty > 0 and next_open is not None and next_open > 0:
-                        est_cost = add_qty * next_open * 1.002  # conservative: include est fee
-                        if est_cost <= portfolio.cash:
-                            scale_order = broker.execute_market(symbol, "buy", add_qty, next_open, f"probe_confirm_{position.probe_tier}")
-                            portfolio.cash -= scale_order.quantity * scale_order.filled_price + scale_order.fee
-                            entry_notional = self._trade_entry_notional(position) + scale_order.quantity * scale_order.filled_price
-                            position.quantity += scale_order.quantity
-                            position.entry_notional = entry_notional
-                            position.avg_entry_price = entry_notional / position.quantity if position.quantity > 0 else position.entry_price
-                            position.confirm_entry_price = scale_order.filled_price
-                            orders.append(scale_order)
-                            self._write_orders(session, run_id, next_time, [scale_order],
-                                [OrderMetadata(
-                                    mechanism="pump_probe_confirm",
-                                    trigger=f"probe_{position.probe_tier}_scale_in",
-                                    details={
-                                        "probe_entry_price": position.probe_entry_price or position.entry_price,
-                                        "confirm_entry_price": position.confirm_entry_price,
-                                        "avg_entry_price": position.avg_entry_price,
-                                        "entry_notional": position.entry_notional,
-                                    },
-                                )])
-                elif forced_reason is not None:
-                    next_open = self._next_open(candles_1h, symbol, next_time)
-                    if next_open is not None:
-                        self._full_exit(
-                            session,
-                            run_id,
-                            next_time,
-                            symbol,
-                            position,
-                            portfolio,
-                            candles_1h,
-                            broker,
-                            orders,
-                            market_state,
-                            stop_before,
-                            forced_reason,
-                            now,
+            stop_mechanism_before = position.stop_mechanism
+            stop_trigger_before = position.stop_trigger
+            forced_reason = self._update_pump_stop(position, current, now, market_state.exit_profile)
+            if forced_reason == "probe_confirm":
+                add_qty = position.probe_add_qty
+                next_open = self._next_open(candles_1h, symbol, next_time)
+                if add_qty > 0 and next_open is not None and next_open > 0:
+                    risk_prices = self._pump_latest_prices(candles_1h, list(portfolio.positions), now)
+                    equity = portfolio.equity(risk_prices)
+                    active_pct = self._active_capital_pct(equity)
+                    exposure_cap = cfg.max_total_exposure_pct * active_pct
+                    pump_exposure = portfolio.gross_exposure(equity, risk_prices)
+                    add_qty = min(
+                        add_qty,
+                        equity * max(exposure_cap - pump_exposure, 0) / next_open,
+                        max(
+                            equity * active_pct * cfg.max_symbol_position_pct
+                            - position.quantity * risk_prices.get(symbol, position.entry_price),
+                            0,
                         )
-                    continue
-            else:
-                self._update_position_stop(position, current, market_state)
-
-            # v1: check for failed state — full exit
-            if position.position_type == "main" and position.state == "failed" and position.weakened:
+                        / next_open,
+                    )
+                    if cfg.portfolio_open_risk_enabled:
+                        add_qty = self._risk_capped_quantity(
+                            portfolio,
+                            risk_prices,
+                            equity,
+                            add_qty,
+                            max(next_open - position.stop_price, 0.0),
+                            cfg.max_portfolio_open_risk_pct,
+                        )
+                    est_cost = add_qty * next_open * 1.002
+                    if add_qty > 0 and est_cost <= portfolio.cash:
+                        scale_order = broker.execute_market(symbol, "buy", add_qty, next_open, f"probe_confirm_{position.probe_tier}")
+                        portfolio.cash -= scale_order.quantity * scale_order.filled_price + scale_order.fee
+                        entry_notional = self._trade_entry_notional(position) + scale_order.quantity * scale_order.filled_price
+                        position.quantity += scale_order.quantity
+                        position.entry_notional = entry_notional
+                        position.avg_entry_price = entry_notional / position.quantity if position.quantity > 0 else position.entry_price
+                        position.confirm_entry_price = scale_order.filled_price
+                        position.core_qty = max(position.core_qty or 0.0, position.quantity - scale_order.quantity)
+                        position.add_qty += scale_order.quantity
+                        position.add_entry_price = scale_order.filled_price
+                        position.add_opened_at = next_time
+                        position.add_highest_price = scale_order.filled_price
+                        orders.append(scale_order)
+                        self._write_orders(session, run_id, next_time, [scale_order],
+                            [OrderMetadata(
+                                mechanism="pump_probe_confirm",
+                                trigger=f"probe_{position.probe_tier}_scale_in",
+                                details={
+                                    "probe_entry_price": position.probe_entry_price or position.entry_price,
+                                    "confirm_entry_price": position.confirm_entry_price,
+                                    "avg_entry_price": position.avg_entry_price,
+                                    "entry_notional": position.entry_notional,
+                                    "core_qty": position.core_qty,
+                                    "add_qty": position.add_qty,
+                                    "probe_stage": position.probe_stage,
+                                },
+                            )])
+            elif forced_reason == "add_tranche_exit":
+                next_open = self._next_open(candles_1h, symbol, next_time)
+                if next_open is not None:
+                    self._partial_add_exit(
+                        session,
+                        run_id,
+                        next_time,
+                        symbol,
+                        position,
+                        portfolio,
+                        candles_1h,
+                        broker,
+                        orders,
+                        market_state,
+                        stop_before,
+                        stop_mechanism_before,
+                        stop_trigger_before,
+                        now,
+                    )
+                continue
+            elif forced_reason is not None:
                 next_open = self._next_open(candles_1h, symbol, next_time)
                 if next_open is not None:
                     self._full_exit(
@@ -849,11 +666,10 @@ class ResearchBacktester:
                         orders,
                         market_state,
                         stop_before,
-                        "failed_exit",
+                        forced_reason,
                         now,
                     )
                 continue
-
             # normal stop check
             if float(current["low"].iloc[-1]) > position.stop_price:
                 continue
@@ -862,10 +678,7 @@ class ResearchBacktester:
             if next_open is None:
                 continue
             mechanism = position.stop_mechanism
-            if position.position_type == "pump":
-                reason = mechanism if mechanism.startswith("pump_") else "pump_stop"
-            else:
-                reason = mechanism if mechanism in ("trailing_stop", "breakeven_stop", "defensive_exit") else "atr_stop"
+            reason = mechanism if mechanism.startswith("pump_") else "pump_stop"
             self._full_exit(
                 session,
                 run_id,
@@ -881,6 +694,83 @@ class ResearchBacktester:
                 reason,
                 now,
             )
+
+    def _partial_add_exit(
+        self,
+        session: Session,
+        run_id: int,
+        exit_time: datetime,
+        symbol: str,
+        position: OpenPosition,
+        portfolio: Portfolio,
+        candles_1h: dict[str, pd.DataFrame],
+        broker: BacktestBroker,
+        orders: list[Order],
+        market_state: MarketState,
+        stop_before: float,
+        stop_mechanism_before: str,
+        stop_trigger_before: str,
+        trigger_time: datetime,
+    ) -> None:
+        """Exit only the high-cost add tranche and keep the core position open."""
+        add_qty = min(position.add_qty, position.quantity)
+        if add_qty <= 0:
+            return
+        frame = candles_1h.get(symbol, pd.DataFrame())
+        current = self._slice_frame(frame, trigger_time) if not frame.empty else pd.DataFrame()
+        exit_price = self._next_open(candles_1h, symbol, exit_time)
+        if exit_price is None:
+            exit_price = float(current["close"].iloc[-1]) if not current.empty else position.add_entry_price
+        if exit_price <= 0:
+            return
+
+        order = broker.execute_market(symbol, "sell", add_qty, exit_price, "pump_add_tranche_exit")
+        if order.filled_price <= 0:
+            return
+        orders.append(order)
+        portfolio.cash += order.quantity * order.filled_price - order.fee
+
+        add_entry = position.add_entry_price or position.confirm_entry_price or self._trade_entry_price(position)
+        add_pnl = (order.filled_price - add_entry) * order.quantity - order.fee
+        position.quantity = max(position.quantity - order.quantity, 0.0)
+        position.add_qty = max(position.add_qty - order.quantity, 0.0)
+        if position.add_qty <= 1e-12:
+            position.add_qty = 0.0
+            position.add_opened_at = None
+            position.add_highest_price = 0.0
+            position.add_entry_price = 0.0
+
+        remaining_notional = max(position.entry_notional - order.quantity * add_entry, 0.0)
+        position.entry_notional = remaining_notional
+        position.avg_entry_price = remaining_notional / position.quantity if position.quantity > 0 else position.entry_price
+        position.stop_mechanism = "pump_add_tranche_exit"
+        position.stop_trigger = "pump_add_failed_follow_through"
+
+        details = self._exit_details(position, current, market_state, stop_before, order.filled_price, trigger_time)
+        details.update(
+            {
+                "partial_exit": True,
+                "add_exit_qty": order.quantity,
+                "add_entry_price": add_entry,
+                "add_exit_pnl": add_pnl,
+                "remaining_qty": position.quantity,
+                "remaining_avg_entry_price": position.avg_entry_price,
+            }
+        )
+        partial_mechanism = position.stop_mechanism
+        partial_trigger = position.stop_trigger
+        self._write_orders(
+            session,
+            run_id,
+            exit_time,
+            [order],
+            [OrderMetadata(mechanism=partial_mechanism, trigger=partial_trigger, details=details)],
+        )
+        if position.quantity <= 1e-12:
+            del portfolio.positions[symbol]
+        else:
+            position.stop_mechanism = stop_mechanism_before
+            position.stop_trigger = stop_trigger_before
 
     def _full_exit(
         self,
@@ -914,23 +804,24 @@ class ResearchBacktester:
         pnl = (order.filled_price - entry_anchor) * position.quantity - order.fee
         portfolio.cash += order.quantity * order.filled_price - order.fee
         won = order.filled_price > entry_anchor
-        portfolio.record_trade(pnl, won, position.position_type)
-        if self._last_engine is not None:
-            self._last_engine.feed_trade_result(won)
-        # v20: track exit reason for adaptive risk
-        if position.position_type == "pump":
-            cfg_ar = self.config.pump_mode
-            self._pump_recent_exits.append(reason or '?')
-            lookback = getattr(cfg_ar, 'adaptive_risk_lookback', 20)
-            if len(self._pump_recent_exits) > lookback * 2:
-                self._pump_recent_exits = self._pump_recent_exits[-lookback * 2:]
-            # Record post-entry price path for analysis
-            post = self._compute_post_entry_path(candles_1h, symbol, position.opened_at, entry_anchor, trigger_time)
-            if post:
-                post['symbol'] = symbol
-                post['exit_reason'] = reason
-                post['pnl'] = pnl
-                self._pump_post_entry.append(post)
+        portfolio.record_trade(pnl, won)
+        cfg_ar = self.config.pump_mode
+        self._pump_recent_exits.append(reason or "?")
+        self._pump_symbol_last_exit[symbol] = (exit_time, reason or "?")
+        if (
+            cfg_ar.failed_reentry_cooldown_enabled
+            and reason in set(cfg_ar.failed_reentry_exit_reasons)
+        ):
+            self._pump_symbol_cooldowns[symbol] = exit_time + timedelta(hours=cfg_ar.failed_reentry_cooldown_hours)
+        lookback = cfg_ar.adaptive_risk_lookback
+        if len(self._pump_recent_exits) > lookback * 2:
+            self._pump_recent_exits = self._pump_recent_exits[-lookback * 2:]
+        post = self._compute_post_entry_path(candles_1h, symbol, position.opened_at, entry_anchor, trigger_time)
+        if post:
+            post["symbol"] = symbol
+            post["exit_reason"] = reason
+            post["pnl"] = pnl
+            self._pump_post_entry.append(post)
         del portfolio.positions[symbol]
         details = self._exit_details(position, current, market_state, stop_before, order.filled_price, trigger_time)
         self._write_orders(
@@ -942,212 +833,13 @@ class ResearchBacktester:
         )
         self._write_position(session, run_id, exit_time, position, "closed", order.filled_price)
 
-    def _update_position_states(
+    def _update_pump_stop(
         self,
-        portfolio: Portfolio,
-        candles: dict[str, pd.DataFrame],
-        now: datetime,
-        factors: pd.DataFrame | None = None,
-    ) -> None:
-        """Update position states: strong → weakening → failed (White Paper §9.6).
-
-        Args:
-            factors: current factor scores DataFrame (for rank-based weakening check).
-        """
-        rc = self.config.risk
-
-        # Build rank lookup from factor scores if available
-        rank_map: dict[str, int] = {}
-        if factors is not None and not factors.empty:
-            scored = factors.sort_values("final_score", ascending=False).reset_index(drop=True)
-            for idx, row in enumerate(scored.itertuples(), start=1):
-                rank_map[str(row.symbol)] = idx
-
-        for symbol, position in list(portfolio.positions.items()):
-            if position.position_type != "main":
-                continue
-            frame = candles.get(symbol, pd.DataFrame())
-            if frame.empty or position.weakened:
-                continue
-
-            close = float(frame["close"].iloc[-1])
-            ma_short = float(frame["close"].rolling(20).mean().iloc[-1])
-            high_since_entry = max(position.highest_price or position.entry_price, float(frame["high"].max()))
-
-            rank = rank_map.get(symbol, 999)
-
-            # Check weakening conditions (White Paper §9.6)
-            weakening = False
-
-            # A: rank > 5 AND close < 1H MA20
-            below_short_ma = close < ma_short
-            rank_dropped = rank > rc.weakening_rank_threshold
-
-            # B: drawdown from highest > 1.5x ATR
-            dd_from_high = high_since_entry - close
-            deep_drawdown = dd_from_high > rc.weakening_drawdown_atr_multiple * position.atr
-
-            # D: volume stall on held position
-            from crypto_quant.factors.volume_stall import detect_volume_stall
-            stall = detect_volume_stall(symbol, frame, candles, rc)
-
-            # State transitions
-            failing = False
-
-            # Strong → Weakening
-            if rank_dropped and below_short_ma:
-                weakening = True
-            elif rank_dropped and deep_drawdown:
-                weakening = True
-            elif stall.stalled:
-                weakening = True
-
-            # Weakening → Failed
-            if below_short_ma and close < ma_short * 0.95:  # clear break below MA
-                failing = True
-            if dd_from_high > rc.weakening_drawdown_atr_multiple * 2.0 * position.atr:
-                failing = True
-            if rank > rc.weakening_rank_upper:  # rank > 15 per white paper
-                failing = True
-
-            if failing:
-                position.state = "failed"
-            elif weakening:
-                position.state = "weakening"
-
-    def _weakening_reduce(
-        self,
-        session: Session,
-        run_id: int,
-        now: datetime,
-        next_time: datetime,
-        symbol: str,
         position: OpenPosition,
-        portfolio: Portfolio,
-        candles_1h: dict[str, pd.DataFrame],
-        broker: BacktestBroker,
-        orders: list[Order],
-    ) -> None:
-        """Reduce position by weakening_reduction_pct and tighten stops."""
-        rc = self.config.risk
-        reduction_pct = rc.weakening_reduction_pct
-        sell_qty = position.quantity * reduction_pct
-
-        next_open = self._next_open(candles_1h, symbol, next_time)
-        if next_open is None:
-            return
-
-        order = broker.execute_market(symbol, "sell", sell_qty, next_open, "weakening_reduce")
-        if order.filled_price <= 0:
-            return
-
-        orders.append(order)
-        pnl = (order.filled_price - position.entry_price) * sell_qty - order.fee
-        portfolio.cash += order.quantity * order.filled_price - order.fee
-        won = order.filled_price > position.entry_price
-        portfolio.record_trade(pnl, won, position.position_type)
-        if self._last_engine is not None:
-            self._last_engine.feed_trade_result(won)
-
-        # reduce remaining position and tighten trailing
-        position.quantity -= sell_qty
-        position.weakened = True
-        if position.quantity <= 0:
-            del portfolio.positions[symbol]
-            self._write_position(session, run_id, next_time, position, "closed", order.filled_price)
-            return
-
-        # tighten trailing stop for remaining position if active
-        if position.trailing_active and position.highest_price is not None:
-            new_trailing = position.highest_price - position.atr * rc.weakening_trailing_multiple
-            if new_trailing > position.stop_price:
-                position.stop_price = new_trailing
-                position.stop_mechanism = "trailing_stop_tightened"
-                position.stop_trigger = "low_below_tightened_trailing"
-
-        self._write_orders(
-            session,
-            run_id,
-            next_time,
-            [order],
-            [OrderMetadata(mechanism="weakening_reduce", trigger="state_transition")],
-        )
-        self._write_position(session, run_id, next_time, position, "weakening", order.filled_price)
-
-    def _update_position_stop(self, position: OpenPosition, current: pd.DataFrame, market_state: MarketState) -> None:
-        if position.atr <= 0:
-            return
-        current = self._position_history(current, position.opened_at)
-        if current.empty:
-            return
-        high = float(current["high"].max())
-        close = float(current["close"].iloc[-1])
-        position.highest_price = max(position.highest_price or position.entry_price, high)
-
-        # v1: hybrid stop — use structure level if available (White Paper §8.2 Scheme C)
-        if self.config.risk.hybrid_stop_enabled and position.stop_mechanism == "initial_atr_stop":
-            structure_stop = self._find_structure_stop(current, position)
-            if structure_stop is not None:
-                atr_stop = position.entry_price - position.atr * self.config.risk.atr_stop_multiple
-                # Use structure stop if it's tighter (higher) than ATR stop
-                if structure_stop > atr_stop:
-                    position.stop_price = structure_stop
-                    position.stop_mechanism = "structure_stop"
-                    position.stop_trigger = "low_below_structure"
-                    position.last_stop_update = {
-                        "trigger": "structure_stop",
-                        "structure_stop": structure_stop,
-                        "atr_stop": atr_stop,
-                    }
-
-        if self.config.risk.enable_breakeven_stop:
-            activation = position.entry_price + position.atr * self.config.risk.breakeven_activation_atr_multiple
-            if high >= activation:
-                breakeven = position.entry_price * (1 - self.config.risk.breakeven_buffer_bps / 10_000)
-                new_stop = max(position.stop_price, min(breakeven, close))
-                if new_stop > position.stop_price:
-                    position.stop_price = new_stop
-                    position.stop_mechanism = "breakeven_stop"
-                    position.stop_trigger = "low_below_breakeven_stop"
-                    position.last_stop_update = {
-                        "trigger": "breakeven_activation",
-                        "activation_price": activation,
-                        "highest_price": position.highest_price,
-                    }
-        if self.config.risk.enable_trailing_stop:
-            activation = position.entry_price + position.atr * self.config.risk.trailing_activation_atr_multiple
-            if high >= activation:
-                position.trailing_active = True
-                trailing_stop = high - position.atr * self.config.risk.trailing_stop_atr_multiple
-                new_stop = max(position.stop_price, min(trailing_stop, close))
-                if new_stop > position.stop_price:
-                    position.stop_price = new_stop
-                    position.stop_mechanism = "trailing_stop"
-                    position.stop_trigger = "low_below_trailing_stop"
-                    position.last_stop_update = {
-                        "trigger": "trailing_activation",
-                        "activation_price": activation,
-                        "highest_price": position.highest_price,
-                        "trailing_width_atr": self.config.risk.trailing_stop_atr_multiple,
-                    }
-        if (
-            self.config.risk.defensive_tighten_existing_positions
-            and market_state.state == "defensive"
-            and close <= position.entry_price + position.atr
-        ):
-            defensive_stop = close - position.atr * self.config.risk.defensive_tighten_atr_multiple
-            new_stop = max(position.stop_price, defensive_stop)
-            if new_stop > position.stop_price:
-                position.stop_price = new_stop
-                position.stop_mechanism = "defensive_exit"
-                position.stop_trigger = "low_below_defensive_tightened_stop"
-                position.last_stop_update = {
-                    "trigger": "defensive_tighten",
-                    "market_state": market_state.state,
-                    "defensive_tighten_atr": self.config.risk.defensive_tighten_atr_multiple,
-                }
-
-    def _update_pump_stop(self, position: OpenPosition, current: pd.DataFrame, now: datetime) -> str | None:
+        current: pd.DataFrame,
+        now: datetime,
+        current_exit_profile: str = "normal",
+    ) -> str | None:
         cfg = self.config.pump_mode
         if position.atr <= 0:
             return None
@@ -1165,6 +857,10 @@ class ResearchBacktester:
         position.max_favorable_pct = max(position.max_favorable_pct, mfe_pct)
 
         held_hours = (ensure_utc(now) - ensure_utc(position.opened_at)).total_seconds() / 3600
+        exit_profile = self._effective_exit_profile(position.exit_profile, current_exit_profile)
+        tighten = exit_profile in {"light_tighten", "tighten", "aggressive_tighten"}
+        aggressive = exit_profile == "aggressive_tighten"
+        cold_squeeze = exit_profile == "cold_squeeze"
 
         # Experimental, default-off: use signal-bar metadata captured at entry.
         # Do not derive this from post-entry candles; that shifts the rule into a different time axis.
@@ -1178,23 +874,133 @@ class ResearchBacktester:
                 position.stop_trigger = "pump_signal_low_ema_b_tier"
                 return "pump_lowconf_kill"
 
-        # v2.0: probe confirmation at 4h
-        if position.is_probe and not position.probe_confirmed and held_hours >= 3.5:
+        if (
+            cfg.early_probe_fail_enabled
+            and position.is_probe
+            and not position.probe_confirmed
+            and held_hours >= cfg.early_probe_fail_hours
+        ):
+            early_ret = close / anchor_price - 1
+            if early_ret <= cfg.early_probe_fail_ret_pct and mfe_pct < cfg.early_probe_fail_mfe_max_pct:
+                position.stop_mechanism = "pump_early_probe_fail"
+                position.stop_trigger = "pump_probe_no_mfe_early_loss"
+                return "pump_early_probe_fail"
+
+        if cold_squeeze and position.is_probe and not position.probe_confirmed:
+            if held_hours >= cfg.cold_squeeze_fail_hours:
+                early_ret = close / anchor_price - 1
+                if mfe_pct < cfg.cold_squeeze_fail_mfe_pct or early_ret <= cfg.cold_squeeze_fail_ret_pct:
+                    position.stop_mechanism = "pump_cold_squeeze_fail"
+                    position.stop_trigger = "pump_cold_no_fast_follow_through"
+                    return "pump_cold_squeeze_fail"
+            if (
+                cfg.cold_squeeze_confirm_enabled
+                and held_hours >= 2.5
+                and close >= anchor_price
+                and mfe_pct >= cfg.cold_squeeze_confirm_mfe_pct
+            ):
+                target_qty = position.probe_full_qty * cfg.cold_squeeze_confirm_target_pct
+                remaining_qty = target_qty - position.quantity
+                position.probe_confirmed = True
+                position.probe_add_qty = max(remaining_qty, 0.0)
+                return "probe_confirm" if position.probe_add_qty > 0 else None
+
+        if cfg.two_stage_confirm_enabled and not cold_squeeze and position.is_probe:
+            ret_4h_val = close / anchor_price - 1
+            if position.probe_stage <= 0 and held_hours >= 3.5:
+                if ret_4h_val >= 0:
+                    target_qty = position.probe_full_qty * cfg.two_stage_weak_target_pct
+                    remaining_qty = target_qty - position.quantity
+                    position.probe_confirmed = True
+                    position.probe_stage = 1
+                    position.probe_add_qty = max(remaining_qty, 0.0)
+                    return "probe_confirm" if position.probe_add_qty > 0 else None
+                if ret_4h_val <= -0.02:
+                    tight_stop = close - position.atr * 0.3
+                    if tight_stop > position.stop_price:
+                        position.stop_price = tight_stop
+                        position.stop_mechanism = "pump_probe_kill"
+                        position.stop_trigger = "pump_probe_4h_dead"
+            elif position.probe_stage == 1:
+                strong_confirm = (
+                    mfe_pct >= cfg.two_stage_strong_mfe_pct
+                    or ret_4h_val >= cfg.two_stage_strong_ret_pct
+                )
+                if strong_confirm:
+                    target_qty = position.probe_full_qty * cfg.two_stage_strong_target_pct
+                    remaining_qty = target_qty - position.quantity
+                    position.probe_stage = 2
+                    position.probe_add_qty = max(remaining_qty, 0.0)
+                    return "probe_confirm" if position.probe_add_qty > 0 else None
+
+        if (
+            not cfg.two_stage_confirm_enabled
+            and not cold_squeeze
+            and position.is_probe
+            and not position.probe_confirmed
+            and held_hours >= 3.5
+        ):
             ret_4h_val = close / anchor_price - 1
             if ret_4h_val >= 0:
-                # Confirm: mark for scale-in (handled in _process_stops)
-                remaining_qty = position.probe_full_qty - position.quantity
+                target_pct = (
+                    cfg.probe_confirm_target_pct_a
+                    if position.probe_tier == "A"
+                    else cfg.probe_confirm_target_pct_b
+                )
+                if cfg.staged_confirm_enabled:
+                    strong_confirm = (
+                        mfe_pct >= cfg.staged_confirm_strong_mfe_pct
+                        or ret_4h_val >= cfg.staged_confirm_strong_ret_pct
+                    )
+                    if not strong_confirm:
+                        target_pct = (
+                            cfg.staged_confirm_weak_target_pct_a
+                            if position.probe_tier == "A"
+                            else cfg.staged_confirm_weak_target_pct_b
+                        )
+                target_qty = position.probe_full_qty * target_pct
+                remaining_qty = target_qty - position.quantity
+                if remaining_qty <= 0:
+                    position.probe_confirmed = True
+                    position.probe_add_qty = 0.0
+                    return None
                 if remaining_qty > 0:
                     position.probe_confirmed = True
                     position.probe_add_qty = remaining_qty
                     return 'probe_confirm'
             elif ret_4h_val <= -0.02:
-                # Kill: tighten stop to near current price, force exit
                 tight_stop = close - position.atr * 0.3
                 if tight_stop > position.stop_price:
                     position.stop_price = tight_stop
                     position.stop_mechanism = 'pump_probe_kill'
                     position.stop_trigger = 'pump_probe_4h_dead'
+
+        if (
+            cfg.add_tranche_exit_enabled
+            and position.add_qty > 0
+            and position.add_entry_price > 0
+            and position.add_opened_at is not None
+            and not position.trailing_active
+        ):
+            add_history = self._position_history(current, position.add_opened_at)
+            if not add_history.empty:
+                add_high = float(add_history["high"].max())
+                position.add_highest_price = max(position.add_highest_price or position.add_entry_price, add_high)
+            add_held_hours = (ensure_utc(now) - ensure_utc(position.add_opened_at)).total_seconds() / 3600
+            add_mfe = position.add_highest_price / position.add_entry_price - 1
+            add_ret = close / position.add_entry_price - 1
+            if add_ret <= cfg.add_tranche_stop_pct:
+                position.stop_mechanism = "pump_add_tranche_exit"
+                position.stop_trigger = "pump_add_confirm_price_lost"
+                return "add_tranche_exit"
+            if (
+                add_held_hours >= cfg.add_tranche_fail_hours
+                and add_mfe < cfg.add_tranche_fail_mfe_pct
+                and add_ret <= cfg.add_tranche_fail_ret_pct
+            ):
+                position.stop_mechanism = "pump_add_tranche_exit"
+                position.stop_trigger = "pump_add_no_follow_through"
+                return "add_tranche_exit"
 
         if len(current) >= 3:
             post_close = current['close'].astype(float)
@@ -1205,11 +1011,23 @@ class ResearchBacktester:
                 position.stop_mechanism = 'pump_3h_down'
                 position.stop_trigger = 'pump_consecutive_down'
                 return 'pump_3h_down'
-        if held_hours >= cfg.stagnation_stop_hours and position.max_favorable_pct < cfg.stagnation_min_mfe_pct:
+        stagnation_hours = 3.0 if cold_squeeze else (4.0 if aggressive else (5.0 if tighten else cfg.stagnation_stop_hours))
+        if cold_squeeze:
+            stagnation_mfe = max(cfg.stagnation_min_mfe_pct, cfg.cold_squeeze_fail_mfe_pct)
+        elif aggressive:
+            stagnation_mfe = min(cfg.stagnation_min_mfe_pct, 0.06)
+        else:
+            stagnation_mfe = cfg.stagnation_min_mfe_pct
+        if held_hours >= stagnation_hours and position.max_favorable_pct < stagnation_mfe:
+            if cfg.add_tranche_stagnation_first_enabled and position.add_qty > 0 and not position.trailing_active:
+                position.stop_mechanism = "pump_add_tranche_stagnation_exit"
+                position.stop_trigger = "pump_stagnation_first_exit_add"
+                return "add_tranche_exit"
             position.stop_mechanism = "pump_stagnation_exit"
             position.stop_trigger = "pump_no_fast_follow_through"
             return "pump_stagnation_exit"
-        if held_hours >= cfg.time_stop_hours and close < anchor_price * (1 + cfg.time_stop_min_profit_pct):
+        time_stop_hours = 6.0 if cold_squeeze else (6.0 if aggressive else (8.0 if tighten else cfg.time_stop_hours))
+        if held_hours >= time_stop_hours and close < anchor_price * (1 + cfg.time_stop_min_profit_pct):
             position.stop_mechanism = "pump_time_exit"
             position.stop_trigger = "pump_time_stop"
             return "pump_time_exit"
@@ -1223,17 +1041,19 @@ class ResearchBacktester:
                 new_stop = protected
                 mechanism = "pump_profit_protect"
                 trigger = "low_below_pump_profit_protect"
-        # v2.2: same lock/breakeven for all positions (keep v2.0's working levels)
-        if mfe_pct >= 0.08 and anchor_price > new_stop:
+        breakeven_trigger = 0.05 if cold_squeeze else (0.04 if aggressive else (0.06 if tighten else 0.08))
+        if mfe_pct >= breakeven_trigger and anchor_price > new_stop:
             new_stop = anchor_price
             mechanism = "pump_breakeven"
-            trigger = "pump_be_8pct"
-        if mfe_pct >= 0.10:
-            lock_stop = anchor_price * 1.02
+            trigger = f"pump_be_{breakeven_trigger:.0%}_mfe"
+        lock_trigger = 0.10 if cold_squeeze else (0.08 if aggressive else 0.10)
+        lock_pct = 0.015 if cold_squeeze or aggressive else 0.02
+        if mfe_pct >= lock_trigger:
+            lock_stop = anchor_price * (1 + lock_pct)
             if lock_stop > new_stop:
                 new_stop = lock_stop
-                mechanism = "pump_lock_2pct"
-                trigger = "pump_lock_10pct_mfe"
+                mechanism = "pump_lock_2pct" if abs(lock_pct - 0.02) < 1e-9 else "pump_lock_1_5pct"
+                trigger = f"pump_lock_{lock_trigger:.0%}_mfe"
 
         trailing_multiple: float | None = None
         if mfe_pct >= cfg.trailing_3_profit_pct:
@@ -1250,9 +1070,17 @@ class ResearchBacktester:
                 trigger = "low_below_pump_trailing"
                 position.trailing_active = True
 
-        # v2.5G Step 2: MFE floor on avg_entry — prevent high-MFE trades from losing.
-        # ONLY for unconfirmed trades (anchor ≈ avg_entry). Confirmed trades with
-        # breathing gap already have lock/breakeven/trailing anchored to probe_entry.
+        if (
+            cfg.scaled_avg_floor_enabled
+            and position.probe_confirmed
+            and trade_entry_price > 0
+            and trade_mfe_pct >= cfg.scaled_avg_floor_mfe_pct
+        ):
+            if trade_entry_price > new_stop:
+                new_stop = trade_entry_price
+                mechanism = "pump_scaled_avg_floor"
+                trigger = f"pump_scaled_avg_floor_{cfg.scaled_avg_floor_mfe_pct:.0%}_mfe"
+
         if cfg.mfe_protect_enabled and trade_entry_price > 0 and anchor_price >= trade_entry_price * 0.98:
             if trade_mfe_pct >= 0.40:
                 new_stop = max(new_stop, trade_entry_price * cfg.mfe_protect_40pct_mult)
@@ -1275,88 +1103,18 @@ class ResearchBacktester:
             }
         return None
 
-    def _find_structure_stop(self, current: pd.DataFrame, position: OpenPosition) -> float | None:
-        """Find a structure-based stop level from recent swing lows (White Paper §8.2 Scheme C).
+    @staticmethod
+    def _effective_exit_profile(entry_profile: str, current_profile: str) -> str:
+        rank = {"normal": 0, "light_tighten": 1, "tighten": 2, "aggressive_tighten": 3, "cold_squeeze": 4}
+        entry_rank = rank.get(entry_profile, 0)
+        current_rank = rank.get(current_profile, 0)
+        effective_rank = max(entry_rank, current_rank)
+        for name, value in rank.items():
+            if value == effective_rank:
+                return name
+        return "normal"
 
-        Looks for the lowest low in the last 6-12 candles as a structure support.
-        Uses it only if it falls within 1.0-2.5x ATR from entry.
-        """
-        rc = self.config.risk
-        if len(current) < 6:
-            return None
-
-        low = current["low"].astype(float)
-        # Find swing low in last 6-12 candles
-        recent_low = float(low.iloc[-12:].min()) if len(low) >= 12 else float(low.iloc[-6:].min())
-        structure_distance = position.entry_price - recent_low
-        atr_distance = position.atr
-
-        if atr_distance <= 0:
-            return None
-
-        atr_multiple = structure_distance / atr_distance
-        # Only use structure stop if within reasonable ATR range
-        if rc.hybrid_stop_structure_atr_min <= atr_multiple <= rc.hybrid_stop_structure_atr_max:
-            return recent_low
-        return None
-
-    def _check_hard_risk_limits(
-        self,
-        position: OpenPosition,
-        portfolio: Portfolio,
-        prices: dict[str, float],
-        current_atr: float | None = None,
-    ) -> bool:
-        """Check hard risk limits (White Paper §7.7). Returns True if risk reduction is needed."""
-        rc = self.config.risk
-        if position.atr <= 0:
-            return False
-
-        equity = portfolio.equity(prices)
-        if equity <= 0:
-            return True
-
-        price = prices.get(position.symbol, position.entry_price)
-        effective_atr = current_atr if current_atr is not None and current_atr > 0 else position.atr
-        # volatility risk exposure
-        vol_risk = position.quantity * effective_atr * rc.atr_stop_multiple / equity
-        if vol_risk > rc.hard_risk_volatility_exposure_pct:
-            return True
-
-        # ATR expansion + drawdown check
-        if hasattr(position, "entry_atr") and position.entry_atr > 0:
-            atr_expansion = effective_atr / position.entry_atr
-            if atr_expansion > rc.hard_risk_atr_expansion:
-                drawdown_from_high = (position.highest_price or price) - price
-                if position.highest_price and drawdown_from_high > rc.hard_risk_dd_atr_multiple * effective_atr:
-                    return True
-
-        return False
-
-    def _fast_factors(self, cur_1h: dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """Build factor DataFrame from pre-computed columns (no per-symbol computation)."""
-        rows = []
-        for sym, frame in cur_1h.items():
-            if frame.empty:
-                continue
-            last = frame.iloc[-1]
-            if "weighted_return" not in frame.columns or pd.isna(last.get("weighted_return")):
-                continue
-            rows.append({
-                "symbol": sym,
-                "weighted_return": float(last["weighted_return"]),
-                "momentum_score": 0.5,
-                "volume_score": 0.5,
-                "trend_score": 0.5,
-                "final_score": 0.5,
-            })
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df["momentum_score"] = df["weighted_return"].rank(pct=True)
-            df["final_score"] = df["momentum_score"]
-        return df.sort_values("final_score", ascending=False).reset_index(drop=True) if not df.empty else df
-
-    def _precompute_indicators(self, candles_1h: dict[str, pd.DataFrame], candles_4h: dict[str, pd.DataFrame]) -> None:
+    def _precompute_indicators(self, candles_1h: dict[str, pd.DataFrame]) -> None:
         """Pre-compute all factor columns on the full candle DataFrames.
         The hourly loop then just reads the last values instead of recomputing.
         """
@@ -1365,9 +1123,7 @@ class ResearchBacktester:
         if len(windows) != len(weights):
             raise ValueError("momentum windows and weights must have the same length")
         min_window = max(windows) if windows else 0
-        vol_cfg = self.config.volume_score
-        trend_cfg = self.config.trend
-        for sym, frame in candles_1h.items():
+        for _sym, frame in candles_1h.items():
             if frame.empty:
                 continue
             close = frame["close"].astype(float)
@@ -1389,10 +1145,9 @@ class ResearchBacktester:
                 frame[ret_col] = close / close.shift(window) - 1
                 weighted_return = weighted_return + frame[ret_col] * float(weight)
             frame["weighted_return"] = weighted_return
-            # v20: precompute ret_6h for pump candidate fast path
             frame["ret_6h"] = close / close.shift(6) - 1
             # Trend helpers
-            frame["ma20"] = close.rolling(trend_cfg.ma_short_period).mean()
+            frame["ma20"] = close.rolling(20).mean()
             frame["ema20"] = close.ewm(span=20, adjust=False).mean()
             ema20_dev = close / frame["ema20"].replace(0, np.nan) - 1
             frame["ema20_dev"] = ema20_dev
@@ -1400,48 +1155,21 @@ class ResearchBacktester:
             # ATR
             tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
             frame["atr14"] = tr.rolling(14).mean()
-            # Volume score mirrors strategy.engine._compute_volume_score.
-            frame["volume_score_col"] = 0.5
-            if vol_cfg.enabled:
-                recent_volume = volume.rolling(vol_cfg.lookback_hours).sum()
-                avg_volume = volume.shift(vol_cfg.lookback_hours).rolling(vol_cfg.average_hours).mean() * vol_cfg.lookback_hours
-                vol_ratio = recent_volume / avg_volume.replace(0, np.nan)
-                price_change = close / close.shift(vol_cfg.lookback_hours) - 1
-                frame["vol_ratio"] = vol_ratio
-                # v2.5: precompute pump-candidate fast-path columns
-                if "quote_volume" in frame.columns:
-                    qv = frame["quote_volume"].astype(float)
-                    frame["qv_6h_sum"] = qv.rolling(6).sum()
-                    frame["qv_24h_sum"] = qv.rolling(24).sum()
-                    frame["qv_30_avg"] = qv.shift(6).rolling(24).mean() * 6
-                frame["above_ma20"] = close > frame["ma20"]
-                cr = high - low
-                frame["wick_ratio"] = (high - close) / cr.replace(0, np.nan)
-                frame["new_12h_high"] = high > high.rolling(12).max().shift(1)
-                regime_avg_volume = volume.shift(2).rolling(48).mean()
-                regime_recent_volume = volume.rolling(6).mean()
-                frame["regime_vol_expansion"] = (
-                    regime_recent_volume / regime_avg_volume.replace(0, np.nan)
-                    >= self.config.pump_mode.regime_hot_volume_expansion_ratio
-                )
-
-                frame.loc[(vol_ratio >= 1.2) & (price_change > 0.005), "volume_score_col"] = (
-                    0.8 + ((vol_ratio - 1.2) * 0.2).clip(upper=0.2)
-                )
-                frame.loc[(vol_ratio >= 1.2) & (price_change <= 0.005), "volume_score_col"] = (
-                    0.1 + (1.0 - vol_ratio / 3.0).clip(lower=0) * 0.2
-                )
-                frame.loc[(vol_ratio >= 0.7) & (vol_ratio < 1.2) & (price_change > 0), "volume_score_col"] = (
-                    0.5 + price_change * 5.0
-                )
-                frame.loc[(vol_ratio < 0.7) & (price_change > -0.01), "volume_score_col"] = 0.4
-                frame.loc[price_change < -0.01, "volume_score_col"] = 0.1
-            frame["volume_score_col"] = frame["volume_score_col"].fillna(0.5)
-            frame["trend_score_col"] = self._precomputed_trend_score(sym, frame, candles_4h)
-        # 4H candles: just add MA50 for BTC
-        btc_4h = candles_4h.get(self.config.market_state.btc_symbol)
-        if btc_4h is not None and not btc_4h.empty:
-            btc_4h["ma50"] = btc_4h["close"].astype(float).rolling(50).mean()
+            if "quote_volume" in frame.columns:
+                qv = frame["quote_volume"].astype(float)
+                frame["qv_6h_sum"] = qv.rolling(6).sum()
+                frame["qv_24h_sum"] = qv.rolling(24).sum()
+                frame["qv_30_avg"] = qv.shift(6).rolling(24).mean() * 6
+            frame["above_ma20"] = close > frame["ma20"]
+            cr = high - low
+            frame["wick_ratio"] = (high - close) / cr.replace(0, np.nan)
+            frame["new_12h_high"] = high > high.rolling(12).max().shift(1)
+            regime_avg_volume = volume.shift(2).rolling(48).mean()
+            regime_recent_volume = volume.rolling(6).mean()
+            frame["regime_vol_expansion"] = (
+                regime_recent_volume / regime_avg_volume.replace(0, np.nan)
+                >= self.config.pump_mode.regime_hot_volume_expansion_ratio
+            )
 
     def _latest_atr(self, frame: pd.DataFrame | None) -> float | None:
         if frame is None or frame.empty:
@@ -1450,64 +1178,7 @@ class ResearchBacktester:
             atr = frame["atr14"].dropna()
             if not atr.empty:
                 return float(atr.iloc[-1])
-        if len(frame) >= self.config.risk.atr_period + 1:
-            value = compute_atr(frame, self.config.risk.atr_period).iloc[-1]
-            if pd.notna(value):
-                return float(value)
         return None
-
-    def _precomputed_trend_score(
-        self,
-        symbol: str,
-        frame_1h: pd.DataFrame,
-        candles_4h: dict[str, pd.DataFrame],
-    ) -> pd.Series:
-        trend_cfg = self.config.trend
-        if not trend_cfg.enabled:
-            return pd.Series(0.5, index=frame_1h.index)
-
-        close = frame_1h["close"].astype(float)
-        high = frame_1h["high"].astype(float) if "high" in frame_1h.columns else close
-        ma_short = close.rolling(trend_cfg.ma_short_period).mean()
-        above_short = (close > ma_short).astype(float) * 0.33
-
-        ma_long = close.rolling(trend_cfg.ma_long_period).mean()
-        ma_long_prev = ma_long.shift(trend_cfg.ma_long_period)
-        frame_4h = candles_4h.get(symbol, pd.DataFrame())
-        if frame_4h is not None and not frame_4h.empty and len(frame_4h) >= trend_cfg.ma_long_period + 1:
-            four_h = frame_4h.sort_index() if isinstance(frame_4h.index, pd.DatetimeIndex) else frame_4h.sort_values("open_time")
-            close_4h = four_h["close"].astype(float)
-            long_df = pd.DataFrame(
-                {
-                    "_time": pd.to_datetime(four_h["open_time"], utc=True),
-                    "ma_long": close_4h.rolling(trend_cfg.ma_long_period).mean(),
-                    "ma_long_prev": close_4h.rolling(trend_cfg.ma_long_period).mean().shift(trend_cfg.ma_long_period),
-                }
-            ).dropna(subset=["ma_long"])
-            if not long_df.empty:
-                base = pd.DataFrame({"_time": pd.to_datetime(frame_1h["open_time"], utc=True)}, index=frame_1h.index)
-                base_sorted = base.sort_values("_time")
-                aligned = pd.merge_asof(
-                    base_sorted,
-                    long_df.sort_values("_time"),
-                    on="_time",
-                    direction="backward",
-                ).set_index(base_sorted.index)
-                ma_long = aligned["ma_long"].reindex(frame_1h.index)
-                ma_long_prev = aligned["ma_long_prev"].reindex(frame_1h.index)
-
-        above_long = (close > ma_long).astype(float) * 0.33
-        slope = ma_long / ma_long_prev - 1
-        slope_score = (slope * 100).clip(lower=0.0, upper=1.0).fillna(0.0) * 0.34
-
-        high_24h = high.rolling(24).max()
-        dd_from_high = close / high_24h.replace(0, np.nan) - 1
-        dd_penalty = (dd_from_high.abs() * 4).clip(upper=0.2).where(
-            dd_from_high < -trend_cfg.max_drawdown_from_24h_high,
-            0.0,
-        )
-
-        return (above_short + above_long + slope_score - dd_penalty.fillna(0.0)).clip(lower=0.0, upper=1.0).fillna(0.5)
 
     def _build_position_cache(self, candles: dict[str, pd.DataFrame], timeline: list[datetime]) -> dict[str, dict[pd.Timestamp, int]]:
         """Pre-compute integer row positions for each (symbol, timestamp) pair.
@@ -1592,70 +1263,22 @@ class ResearchBacktester:
             "trigger_time": trigger_time.isoformat(),
             "opened_at": position.opened_at.isoformat(),
             "position_state": "closed",
-            "strategy_type": position.position_type,
+            "strategy_type": "pump",
+            "entry_market_phase": position.market_phase,
+            "entry_exit_profile": position.exit_profile,
+            "core_qty": position.core_qty,
+            "add_qty": position.add_qty,
+            "probe_stage": position.probe_stage,
+            "add_entry_price": position.add_entry_price,
+            "add_opened_at": position.add_opened_at.isoformat() if position.add_opened_at is not None else None,
             "market_state": market_state.state,
+            "market_phase": market_state.phase,
+            "market_transition": market_state.transition,
+            "market_exit_profile": market_state.exit_profile,
             "market_reasons": market_state.reasons,
             "last_close": close,
             "last_stop_update": position.last_stop_update,
         }
-
-    def _enter_positions(
-        self,
-        session: Session,
-        run_id: int,
-        now: datetime,
-        next_time: datetime,
-        targets: list[TargetPosition],
-        portfolio: Portfolio,
-        candles_1h: dict[str, pd.DataFrame],
-        broker: BacktestBroker,
-        orders: list[Order],
-    ) -> None:
-        for target in targets:
-            next_open = self._next_open(candles_1h, target.symbol, next_time)
-            if next_open is None:
-                self._reject(session, run_id, now, target.symbol, "missing_next_open")
-                continue
-            order = broker.execute_market(target.symbol, "buy", target.quantity, next_open, "next_1h_open")
-            notional = order.quantity * order.filled_price + order.fee
-            if notional > portfolio.cash:
-                self._reject(session, run_id, now, target.symbol, "insufficient_cash")
-                continue
-            portfolio.cash -= notional
-            stop_price = order.filled_price - target.atr * self.config.risk.atr_stop_multiple
-            position = OpenPosition(
-                target.symbol,
-                target.quantity,
-                order.filled_price,
-                stop_price,
-                target.atr,
-                next_time,
-                highest_price=order.filled_price,
-                entry_atr=target.atr,
-            )
-            portfolio.positions[target.symbol] = position
-            orders.append(order)
-            self._write_orders(
-                session,
-                run_id,
-                next_time,
-                [order],
-                [
-                    OrderMetadata(
-                        mechanism="entry",
-                        trigger="next_1h_open",
-                        details={
-                            "signal_time": now.isoformat(),
-                            "entry_price": order.filled_price,
-                            "atr": target.atr,
-                            "stop_price": stop_price,
-                            "atr_stop_multiple": self.config.risk.atr_stop_multiple,
-                            "strategy_type": "main",
-                        },
-                    )
-                ],
-            )
-            self._write_position(session, run_id, next_time, position, "open", order.filled_price)
 
     def _compute_post_entry_path(self, candles_1h, symbol, opened_at, entry_price, now):
         """Record 1h/2h/3h/4h post-entry performance for pump trades."""
@@ -1691,40 +1314,6 @@ class ResearchBacktester:
             result[f'low_below_entry_{h}h'] = (low < entry_price)
         return result
 
-    def _detect_pump_regime(self, candles_1h: dict[str, pd.DataFrame]) -> str:
-        """Detect pump regime from sliced candle dict (uses precomputed columns)."""
-        cfg = self.config.pump_mode
-        ret_24h: list[float] = []
-        new_high_count = 0
-        vol_exp_count = 0
-        total = 0
-        for frame in candles_1h.values():
-            if len(frame) < 50:
-                continue
-            total += 1
-            r24 = float(frame['ret_24h'].iloc[-1]) if 'ret_24h' in frame.columns else float(frame['close'].iloc[-1]/frame['close'].iloc[-25]-1)
-            ret_24h.append(r24)
-            if 'new_12h_high' in frame.columns:
-                if bool(frame['new_12h_high'].iloc[-1]):
-                    new_high_count += 1
-            volume = frame['volume']
-            # v2.5: base volume for regime (quote vol tested separately)
-            if len(volume) >= 50:
-                avg_vol = float(volume.iloc[-50:-2].mean())
-                recent_vol = float(volume.iloc[-6:].mean())
-                if avg_vol > 0 and recent_vol / avg_vol >= cfg.regime_hot_volume_expansion_ratio:
-                    vol_exp_count += 1
-        if total < 20:
-            return "COLD"
-        median_ret = sorted(ret_24h)[len(ret_24h)//2] if ret_24h else 0.0
-        nh_r = new_high_count / total
-        ve_r = vol_exp_count / total
-        if median_ret >= cfg.regime_hot_24h_return_pct and nh_r >= cfg.regime_hot_new_high_ratio and ve_r >= 0.05:
-            return "HOT"
-        if median_ret >= cfg.regime_warm_24h_return_pct and nh_r >= cfg.regime_warm_new_high_ratio:
-            return "WARM"
-        return "COLD"
-
     def _detect_pump_regime_snapshot(self, snapshot: pd.DataFrame) -> str:
         cfg = self.config.pump_mode
         if snapshot.empty:
@@ -1747,85 +1336,241 @@ class ResearchBacktester:
             return "WARM"
         return "COLD"
 
-    def _pump_candidates(
+    def _detect_market_context(
         self,
-        candles_1h: dict[str, pd.DataFrame],
-        portfolio: Portfolio,
-        equity: float,
-        now: datetime,
-    ) -> list[PumpCandidate]:
+        snapshot: pd.DataFrame,
+        btc_1h: pd.DataFrame,
+        fast_valve: bool,
+        fast_reasons: list[str],
+    ) -> MarketState:
         cfg = self.config.pump_mode
-        if not cfg.enabled or equity <= 0:
-            return []
-        if portfolio.daily_realized_loss < 0 and abs(portfolio.daily_realized_loss) > equity * cfg.max_daily_loss_pct:
-            return []
-        regime = self._pump_regime
-        if regime == "COLD":
-            return []
-        consecutive_losses = 0
-        for won in reversed(portfolio.pump_trade_results):
-            if won: break
-            consecutive_losses += 1
-        self._pump_consecutive_losses = consecutive_losses
+        if fast_valve:
+            return MarketState(
+                "risk_off",
+                fast_risk_valve=True,
+                reasons=fast_reasons or ["btc_fast_valve"],
+                phase="risk_off",
+                transition="deteriorating",
+                risk_multiplier=0.0,
+                entry_mode="none",
+                exit_profile="aggressive_tighten" if cfg.market_context_exit_tightening_enabled else "normal",
+            )
+        if not cfg.market_context_enabled:
+            return MarketState("risk_on", reasons=[f"legacy_{self._pump_regime.lower()}"], phase=self._pump_regime.lower())
 
-        candidates: list[PumpCandidate] = []
-        for symbol, frame in candles_1h.items():
-            if symbol in portfolio.positions or len(frame) < 73: continue
-            if 'ret_24h' not in frame.columns: continue
-            price = float(frame['close'].iloc[-1])
-            if price <= 0: continue
-            ret_24h = float(frame['ret_24h'].iloc[-1])
-            if ret_24h < cfg.min_24h_return: continue
-            ret_72h = float(frame['ret_72h'].iloc[-1])
-            ret_6h = float(frame['ret_6h'].iloc[-1])
-            above_ma = bool(frame['above_ma20'].iloc[-1]) if 'above_ma20' in frame.columns else (price > float(frame['ma20'].iloc[-1]))
-            if not above_ma: continue
-            # Volume ratio — use precomputed if available
-            if 'qv_6h_sum' in frame.columns and 'qv_30_avg' in frame.columns:
-                q6 = float(frame['qv_6h_sum'].iloc[-1]); q30 = float(frame['qv_30_avg'].iloc[-1])
-                quote_volume_24h = float(frame['qv_24h_sum'].iloc[-1]) if 'qv_24h_sum' in frame.columns else 0
-                quote_volume_6h = q6
-                volume_ratio = q6 / q30 if q30 > 0 else 0
-            else:
-                qv = frame['quote_volume'].astype(float) if 'quote_volume' in frame.columns else frame['close'].astype(float)*frame['volume'].astype(float)
-                quote_volume_24h = float(qv.iloc[-24:].sum()) if len(qv) >= 24 else 0
-                quote_volume_6h = float(qv.iloc[-6:].sum()) if len(qv) >= 6 else 0
-                avg_v = float(qv.iloc[-30:-6].mean())*6 if len(qv) >= 30 else 0
-                volume_ratio = quote_volume_6h / avg_v if avg_v > 0 else 0
-            if volume_ratio <= 0: continue
-            if quote_volume_24h < cfg.min_quote_volume_24h and quote_volume_6h < cfg.min_quote_volume_6h: continue
-            # Wick check — use precomputed if available
-            if 'wick_ratio' in frame.columns and 'new_12h_high' in frame.columns:
-                if float(frame['wick_ratio'].iloc[-1]) >= self.config.risk.blowoff_wick_ratio and bool(frame['new_12h_high'].iloc[-1]): continue
-            # min_6h
-            min_6h = getattr(cfg, 'min_6h_return', 0.0)
-            if ret_6h < min_6h: continue
-            # Signal classification
-            early = ret_24h >= cfg.min_24h_return and ret_6h >= cfg.early_6h_return and volume_ratio >= cfg.early_volume_ratio_min
-            confirmed_sig = ret_72h >= cfg.min_72h_return and ret_24h >= cfg.min_24h_return and volume_ratio >= cfg.volume_ratio_min
-            warm_early_ok = False
-            if regime == 'WARM':
-                wr6 = getattr(cfg, 'warm_early_6h_return', 0.12); wvr = getattr(cfg, 'warm_early_volume_ratio_min', 2.0)
-                warm_early_ok = ret_24h >= cfg.min_24h_return and ret_6h >= wr6 and volume_ratio >= wvr
-            signal_ok = ((confirmed_sig or early) and regime == 'HOT') or (warm_early_ok and regime == 'WARM')
-            if not signal_ok: continue
-            if ret_72h > cfg.max_72h_return_chase: continue
-            if ret_72h > cfg.max_72h_return_entry: continue
-            if ret_72h > 1.20 and ret_6h / max(ret_24h, 0.001) < 0.30: continue
-            risk_multiplier = 1.0
-            if ret_72h > cfg.max_72h_return_reduced_risk: risk_multiplier = cfg.late_chase_risk_multiplier
-            elif ret_72h > cfg.max_72h_return_full_risk: risk_multiplier = cfg.reduced_risk_multiplier
-            if early and confirmed_sig and ret_72h <= cfg.max_72h_return_full_risk: risk_multiplier *= 1.25
-            atr = self._latest_atr(frame)
-            if atr is None or atr <= 0: continue
-            score = ret_24h * 0.45 + ret_72h * 0.35 + ret_6h * 0.10 + min(volume_ratio / 5.0, 1.0) * 0.10
-            tier = 'A' if (regime=='WARM' and (early or warm_early_ok) and 0.45<=ret_72h<=0.86 and volume_ratio<=15) else 'B'
-            sig_type = "early_confirmed" if (early and confirmed_sig) else ("early" if early else "confirmed")
-            reason = f"pump_{regime}_{tier}_{sig_type}"
-            candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
-                reason=reason, ret_6h=ret_6h, ret_24h=ret_24h, ret_72h=ret_72h, volume_ratio=volume_ratio,
-                quote_volume_24h=quote_volume_24h, tier=tier))
-        return sorted(candidates, key=lambda item: item.score, reverse=True)
+        metrics = self._market_context_metrics(snapshot, btc_1h)
+        history = self._market_feature_history
+        if len(history) < cfg.market_context_min_history:
+            context = self._legacy_market_context(metrics)
+        else:
+            context = self._phase_market_context(metrics, history)
+        self._market_feature_history.append(metrics)
+        if len(self._market_feature_history) > 720:
+            self._market_feature_history = self._market_feature_history[-720:]
+        self._previous_market_phase = context.phase
+        return context
+
+    def _market_context_metrics(self, snapshot: pd.DataFrame, btc_1h: pd.DataFrame) -> dict[str, float]:
+        metrics = {
+            "eligible_count": 0.0,
+            "median_ret_24h": 0.0,
+            "new12h_high_ratio": 0.0,
+            "ret24_gt10_ratio": 0.0,
+            "ret24_gt30_ratio": 0.0,
+            "ret72_gt80_ratio": 0.0,
+            "new_high_high_wick_ratio": 0.0,
+            "sync_down_24h_ratio": 0.0,
+            "vol_expansion_ratio": 0.0,
+            "candidate_count": 0.0,
+            "btc_ret_24h": 0.0,
+            "btc_vol_24h": 0.0,
+            "heat_score": 0.0,
+            "heat_delta_24h": 0.0,
+        }
+        if snapshot.empty:
+            return metrics
+        eligible = snapshot[snapshot["history"].astype(int) >= 73].copy()
+        if eligible.empty:
+            return metrics
+        total = len(eligible)
+        ret24 = eligible["ret_24h"].astype(float)
+        ret72 = eligible["ret_72h"].astype(float)
+        new_high = eligible["new_12h_high"].fillna(False).astype(bool)
+        wick = eligible["wick_ratio"].astype(float)
+        vol_exp = eligible["regime_vol_expansion"].fillna(False).astype(bool)
+        q30 = eligible["qv_30_avg"].astype(float).replace(0, np.nan)
+        volume_ratio = eligible["qv_6h"].astype(float) / q30
+
+        metrics.update(
+            {
+                "eligible_count": float(total),
+                "median_ret_24h": float(ret24.median()),
+                "new12h_high_ratio": float(new_high.mean()),
+                "ret24_gt10_ratio": float((ret24 > 0.10).mean()),
+                "ret24_gt30_ratio": float((ret24 > 0.30).mean()),
+                "ret72_gt80_ratio": float((ret72 > 0.80).mean()),
+                "new_high_high_wick_ratio": float((new_high & (wick > 0.60)).mean()),
+                "sync_down_24h_ratio": float((ret24 < -0.05).mean()),
+                "vol_expansion_ratio": float(vol_exp.mean()),
+                "candidate_count": float(self._market_context_candidate_count(eligible, volume_ratio)),
+            }
+        )
+        if btc_1h is not None and len(btc_1h) >= 25:
+            close = btc_1h["close"].astype(float)
+            metrics["btc_ret_24h"] = float(close.iloc[-1] / close.iloc[-25] - 1) if close.iloc[-25] > 0 else 0.0
+            metrics["btc_vol_24h"] = float(close.pct_change().tail(24).std())
+        metrics["heat_score"] = (
+            metrics["median_ret_24h"]
+            + 0.50 * metrics["new12h_high_ratio"]
+            + 0.30 * metrics["ret24_gt10_ratio"]
+            + 0.20 * metrics["vol_expansion_ratio"]
+            - 0.30 * metrics["ret72_gt80_ratio"]
+            - 0.20 * metrics["new_high_high_wick_ratio"]
+        )
+        if len(self._market_feature_history) >= 6:
+            metrics["heat_delta_24h"] = metrics["heat_score"] - self._market_feature_history[-6]["heat_score"]
+        return metrics
+
+    def _market_context_candidate_count(self, eligible: pd.DataFrame, volume_ratio: pd.Series) -> int:
+        cfg = self.config.pump_mode
+        rough = (
+            (eligible["ret_24h"].astype(float) >= cfg.min_24h_return)
+            & (eligible["ret_6h"].astype(float) >= cfg.min_6h_return)
+            & (eligible["above_ma20"].fillna(False).astype(bool))
+            & (volume_ratio >= cfg.early_volume_ratio_min)
+            & (eligible["ret_72h"].astype(float) <= cfg.max_72h_return_full_risk)
+        )
+        return int(rough.fillna(False).sum())
+
+    def _legacy_market_context(self, metrics: dict[str, float]) -> MarketState:
+        if self._pump_regime == "COLD":
+            phase, entry_mode, risk_multiplier, exit_profile = "cold", "none", 0.0, "normal"
+        elif self._pump_regime == "HOT":
+            phase, entry_mode, risk_multiplier, exit_profile = "expanding", "normal", 1.0, "normal"
+        else:
+            phase, entry_mode, risk_multiplier, exit_profile = (
+                "normal",
+                "patient",
+                self.config.pump_mode.market_context_normal_risk_multiplier,
+                "normal",
+            )
+        return MarketState(
+            phase,
+            reasons=[f"legacy_{self._pump_regime.lower()}_history_warmup"],
+            phase=phase,
+            transition=self._market_transition(phase),
+            risk_multiplier=risk_multiplier,
+            entry_mode=entry_mode,
+            exit_profile=exit_profile,
+            metrics=metrics,
+        )
+
+    def _phase_market_context(self, metrics: dict[str, float], history: list[dict[str, float]]) -> MarketState:
+        cfg = self.config.pump_mode
+        q = self._market_quantiles(history)
+        risk_off = (
+            metrics["heat_score"] <= q["heat_score"][0.2]
+            and metrics["btc_ret_24h"] <= q["btc_ret_24h"][0.2]
+            and metrics["sync_down_24h_ratio"] >= q["sync_down_24h_ratio"][0.8]
+        ) or (
+            metrics["heat_delta_24h"] <= q["heat_delta_24h"][0.2]
+            and metrics["sync_down_24h_ratio"] >= q["sync_down_24h_ratio"][0.8]
+        )
+        crowded_fading = (
+            metrics["ret24_gt10_ratio"] >= q["ret24_gt10_ratio"][0.8]
+            and metrics["ret24_gt30_ratio"] >= q["ret24_gt30_ratio"][0.8]
+            and metrics["heat_delta_24h"] < 0
+        ) or (
+            metrics["new_high_high_wick_ratio"] >= q["new_high_high_wick_ratio"][0.8]
+            and metrics["heat_delta_24h"] < 0
+        )
+        expanding = (
+            metrics["ret24_gt10_ratio"] >= q["ret24_gt10_ratio"][0.8]
+            and metrics["heat_delta_24h"] >= q["heat_delta_24h"][0.8]
+            and metrics["btc_ret_24h"] >= 0
+        )
+        crowded_hot = (
+            metrics["ret24_gt10_ratio"] >= q["ret24_gt10_ratio"][0.8]
+            and metrics["ret24_gt30_ratio"] >= q["ret24_gt30_ratio"][0.8]
+            and metrics["heat_delta_24h"] >= 0
+        )
+        cold = (
+            metrics["ret24_gt10_ratio"] <= q["ret24_gt10_ratio"][0.2]
+            and metrics["new12h_high_ratio"] <= q["new12h_high_ratio"][0.2]
+            and metrics["candidate_count"] <= q["candidate_count"][0.4]
+        )
+
+        if risk_off:
+            phase = "risk_off"
+            entry_mode = "none"
+            risk_multiplier = 0.0
+            exit_profile = "aggressive_tighten" if cfg.market_context_exit_tightening_enabled else "normal"
+        elif expanding:
+            phase, entry_mode, risk_multiplier, exit_profile = "expanding", "normal", 1.0, "normal"
+        elif crowded_hot:
+            phase = "crowded_hot"
+            entry_mode = "normal"
+            risk_multiplier = cfg.market_context_crowded_hot_risk_multiplier
+            exit_profile = "light_tighten" if cfg.market_context_exit_tightening_enabled else "normal"
+        elif crowded_fading:
+            phase = "crowded_fading"
+            entry_mode = "patient"
+            risk_multiplier = cfg.market_context_crowded_fading_risk_multiplier
+            exit_profile = "aggressive_tighten" if cfg.market_context_exit_tightening_enabled else "normal"
+        elif cold:
+            phase, entry_mode, risk_multiplier, exit_profile = "cold", "none", 0.0, "normal"
+        else:
+            phase = "normal"
+            entry_mode = "patient"
+            risk_multiplier = cfg.market_context_normal_risk_multiplier
+            exit_profile = "tighten" if cfg.market_context_exit_tightening_enabled else "normal"
+
+        transition = self._market_transition(phase)
+        reasons = [
+            f"phase={phase}",
+            f"transition={transition}",
+            f"old_regime={self._pump_regime}",
+        ]
+        return MarketState(
+            phase,
+            reasons=reasons,
+            phase=phase,
+            transition=transition,
+            risk_multiplier=risk_multiplier,
+            entry_mode=entry_mode,
+            exit_profile=exit_profile,
+            metrics=metrics,
+        )
+
+    def _market_quantiles(self, history: list[dict[str, float]]) -> dict[str, dict[float, float]]:
+        fields = [
+            "heat_score",
+            "heat_delta_24h",
+            "ret24_gt10_ratio",
+            "ret24_gt30_ratio",
+            "new12h_high_ratio",
+            "new_high_high_wick_ratio",
+            "btc_ret_24h",
+            "sync_down_24h_ratio",
+            "candidate_count",
+        ]
+        frame = pd.DataFrame(history)
+        return {
+            field: {q: float(frame[field].quantile(q)) for q in (0.2, 0.4, 0.8)}
+            for field in fields
+        }
+
+    def _market_transition(self, phase: str) -> str:
+        previous = self._previous_market_phase
+        if phase == previous:
+            return "stable"
+        if phase == "risk_off" or (previous == "crowded_hot" and phase == "crowded_fading"):
+            return "deteriorating"
+        if phase == "expanding" and previous in {"normal", "cold", "crowded_fading", "crowded_hot"}:
+            return "improving"
+        if previous == "risk_off" and phase != "risk_off":
+            return "recovery"
+        return "stable"
 
     def _pump_candidates_from_snapshot(
         self,
@@ -1840,7 +1585,10 @@ class ResearchBacktester:
         if portfolio.daily_realized_loss < 0 and abs(portfolio.daily_realized_loss) > equity * cfg.max_daily_loss_pct:
             return []
         regime = self._pump_regime
-        if regime == "COLD":
+        if regime == "COLD" and not cfg.cold_squeeze_enabled:
+            return []
+        market = self._market_context
+        if market.entry_mode == "none" or market.risk_multiplier <= 0:
             return []
         consecutive_losses = 0
         for won in reversed(portfolio.pump_trade_results):
@@ -1877,12 +1625,28 @@ class ResearchBacktester:
                 continue
             if float(row.wick_ratio) >= self.config.risk.blowoff_wick_ratio and bool(row.new_12h_high):
                 continue
-            # v2.5G: reject long wick + 2h negative return
             if getattr(cfg, 'reject_long_wick_enabled', False):
                 if float(row.wick_ratio) > 0.80 and float(row.r2) < 0:
                     continue
             min_6h = getattr(cfg, "min_6h_return", 0.0)
             if ret_6h < min_6h:
+                continue
+            ema20_dev_pct = float(getattr(row, 'ema20_dev', 0)) * 100
+            cold_squeeze = (
+                cfg.cold_squeeze_enabled
+                and regime == "COLD"
+                and market.entry_mode == "patient"
+                and market.phase in {"normal", "crowded_fading"}
+                and ret_24h >= cfg.cold_squeeze_min_24h_return
+                and ret_24h <= cfg.cold_squeeze_max_24h_return
+                and cfg.cold_squeeze_min_72h_return <= ret_72h <= cfg.cold_squeeze_max_72h_return
+                and quote_volume_24h >= cfg.cold_squeeze_min_quote_volume_24h
+                and cfg.cold_squeeze_min_volume_ratio <= volume_ratio <= cfg.cold_squeeze_max_volume_ratio
+                and cfg.cold_squeeze_min_ema20_dev_pct <= ema20_dev_pct <= cfg.cold_squeeze_max_ema20_dev_pct
+                and float(row.wick_ratio) < cfg.cold_squeeze_max_wick_ratio
+                and ret_6h / max(ret_24h, 0.001) >= cfg.cold_squeeze_min_ret6_to_ret24
+            )
+            if regime == "COLD" and not cold_squeeze:
                 continue
             early = ret_24h >= cfg.min_24h_return and ret_6h >= cfg.early_6h_return and volume_ratio >= cfg.early_volume_ratio_min
             confirmed_sig = ret_72h >= cfg.min_72h_return and ret_24h >= cfg.min_24h_return and volume_ratio >= cfg.volume_ratio_min
@@ -1891,11 +1655,18 @@ class ResearchBacktester:
                 wr6 = getattr(cfg, "warm_early_6h_return", 0.12)
                 wvr = getattr(cfg, "warm_early_volume_ratio_min", 2.0)
                 warm_early_ok = ret_24h >= cfg.min_24h_return and ret_6h >= wr6 and volume_ratio >= wvr
-            signal_ok = ((confirmed_sig or early) and regime == "HOT") or (warm_early_ok and regime == "WARM")
+            signal_ok = cold_squeeze or ((confirmed_sig or early) and regime == "HOT") or (warm_early_ok and regime == "WARM")
             if not signal_ok:
                 continue
-            # r72 overheating: hard reject > 80% (0 trailing in v2.5F)
-            if ret_72h > cfg.max_72h_return_full_risk:
+            if (
+                cfg.reject_hot_confirmed_high_volume_enabled
+                and regime == "HOT"
+                and confirmed_sig
+                and volume_ratio > cfg.reject_hot_confirmed_high_volume_ratio
+            ):
+                continue
+            # r72 overheating: hard reject > 80% for normal pump signals.
+            if not cold_squeeze and ret_72h > cfg.max_72h_return_full_risk:
                 continue
             if ret_72h > cfg.max_72h_return_chase:
                 continue
@@ -1903,33 +1674,64 @@ class ResearchBacktester:
                 continue
             if ret_72h > 1.20 and ret_6h / max(ret_24h, 0.001) < 0.30:
                 continue
-            # only remaining RM modifiers: early_confirmed bonus, bad-B mid
-            risk_multiplier = 1.0
+            risk_multiplier = cfg.cold_squeeze_risk_multiplier if cold_squeeze else 1.0
             if early and confirmed_sig:
                 risk_multiplier *= 1.25
+            risk_multiplier *= market.risk_multiplier
             atr = float(row.atr)
             if pd.isna(atr) or atr <= 0:
                 continue
             score = ret_24h * 0.45 + ret_72h * 0.35 + ret_6h * 0.10 + min(volume_ratio / 5.0, 1.0) * 0.10
+            if cfg.reject_high_score_enabled and score > cfg.reject_high_score_threshold:
+                continue
             tier = "A" if (regime == "WARM" and (early or warm_early_ok) and 0.45 <= ret_72h <= 0.86 and volume_ratio <= 15) else "B"
             sig_type = "early_confirmed" if (early and confirmed_sig) else ("early" if early else "confirmed")
             ema20_dev_rank_2160h = float(row.ema20_dev_rank_2160h)
-            # v2.5G abs EMA filter: lower + upper bounds
+            r1 = float(getattr(row, 'r1', 0))
+            r2 = float(getattr(row, 'r2', 0))
+            r3 = float(getattr(row, 'r3', 0))
+            late_accel = (
+                cfg.late_accel_control_enabled
+                and (
+                    max(r1, r2, r3) > cfg.late_accel_max_r123
+                    or (r1 + r2 + r3) > cfg.late_accel_last3_sum
+                )
+            )
+            if late_accel and tier == "A":
+                tier = "B"
+            if late_accel and confirmed_sig:
+                risk_multiplier *= cfg.late_accel_confirmed_risk_multiplier
+            if (
+                cfg.warm_a_high_ema_downgrade_enabled
+                and regime == "WARM"
+                and tier == "A"
+                and ema20_dev_pct > cfg.warm_a_high_ema_downgrade_pct
+            ):
+                tier = "B"
+            if (
+                cfg.warm_a_late_spike_downgrade_enabled
+                and regime == "WARM"
+                and tier == "A"
+                and (
+                    max(r1, r2, r3) > cfg.warm_a_late_spike_max_r123
+                    or (r1 + r2 + r3) > cfg.warm_a_late_spike_last3_sum
+                )
+            ):
+                tier = "B"
             if getattr(cfg, 'ema_abs_min_enabled', False):
-                ema_abs = float(getattr(row, 'ema20_dev', 0)) * 100
+                ema_abs = ema20_dev_pct
                 if ema_abs < cfg.ema_abs_min_threshold:
                     continue
                 if getattr(cfg, 'ema_abs_max_enabled', False) and ema_abs > cfg.ema_abs_max_threshold:
                     continue
-            # v2.5G: reject weak momentum + all-recent-negative
             if getattr(cfg, 'reject_accel_decay_enabled', False):
-                r1 = float(getattr(row, 'r1', 0))
-                r2 = float(getattr(row, 'r2', 0))
-                r3 = float(getattr(row, 'r3', 0))
                 if ret_6h / max(ret_24h, 0.001) < 0.5 and r1 < 0 and r2 < 0 and r3 < 0:
                     continue
-            # bad-B vr>30: hard reject (0 trailing, handled by vr30_reject)
-            # bad-B vr 15-30: risk × 0.75 (v2.5F, >0 surviving trailing)
+            if (
+                cfg.reject_high_vol_trend_enabled
+                and float(getattr(row, 'vol_trend6', 0)) > cfg.reject_high_vol_trend_threshold
+            ):
+                continue
             if (
                 cfg.bad_b_ema_vr_risk_mid_enabled
                 and tier == "B"
@@ -1938,16 +1740,27 @@ class ResearchBacktester:
                 and cfg.bad_b_volume_ratio_mid_min < volume_ratio <= cfg.bad_b_volume_ratio_mid_max
             ):
                 risk_multiplier *= cfg.bad_b_risk_multiplier_mid
-            # v2.5G: hard reject vr > 30
+            if (
+                market.phase == "crowded_fading"
+                and (
+                    ema20_dev_pct >= cfg.market_context_fading_ema20_dev_pct
+                    or volume_ratio >= cfg.market_context_fading_volume_ratio
+                    or ret_6h >= cfg.market_context_fading_ret_6h
+                )
+            ):
+                risk_multiplier *= cfg.market_context_fading_extreme_multiplier
             if cfg.bad_b_vr30_reject_enabled and volume_ratio > cfg.bad_b_volume_ratio_min:
                 continue
+            if cold_squeeze:
+                tier = "B"
+                sig_type = "cold_squeeze"
             reason = f"pump_{regime}_{tier}_{sig_type}"
             candidates.append(PumpCandidate(symbol=symbol, score=score, price=price, atr=atr, risk_multiplier=risk_multiplier,
                 reason=reason, ret_6h=ret_6h, ret_24h=ret_24h, ret_72h=ret_72h, volume_ratio=volume_ratio,
                 quote_volume_24h=quote_volume_24h, tier=tier, ema20_dev_rank_2160h=ema20_dev_rank_2160h,
-                ema20_dev_pct=float(getattr(row, 'ema20_dev', 0)) * 100,
-                wick_ratio=float(row.wick_ratio), r1=float(getattr(row, 'r1', 0)),
-                r2=float(getattr(row, 'r2', 0)), r3=float(getattr(row, 'r3', 0)),
+                ema20_dev_pct=ema20_dev_pct,
+                wick_ratio=float(row.wick_ratio), r1=r1,
+                r2=r2, r3=r3,
                 pos24h=float(getattr(row, 'pos24h', 0)), vol_trend6=float(getattr(row, 'vol_trend6', 0))))
         return sorted(candidates, key=lambda item: item.score, reverse=True)
 
@@ -1963,14 +1776,16 @@ class ResearchBacktester:
         broker: BacktestBroker,
         orders: list[Order],
         prices: dict[str, float],
+        market: MarketState | None = None,
     ) -> None:
         cfg = self.config.pump_mode
+        market = market or self._market_context
         if not candidates:
             return
         equity = portfolio.equity(prices)
         if equity <= 0:
             return
-        pump_positions = [p for p in portfolio.positions.values() if p.position_type == "pump"]
+        pump_positions = list(portfolio.positions.values())
         slots = max(cfg.max_positions - len(pump_positions), 0)
         if slots <= 0:
             return
@@ -1981,31 +1796,76 @@ class ResearchBacktester:
                 break
             if candidate.symbol in portfolio.positions:
                 continue
+            is_cold_squeeze = "cold_squeeze" in candidate.reason
+            if is_cold_squeeze:
+                cold_positions = sum(1 for position in portfolio.positions.values() if position.exit_profile == "cold_squeeze")
+                if cold_positions >= cfg.cold_squeeze_max_positions:
+                    self._reject(session, run_id, now, candidate.symbol, "pump_cold_squeeze_slot_limit")
+                    continue
+            cooldown_until = self._pump_symbol_cooldowns.get(candidate.symbol)
+            if cooldown_until is not None and ensure_utc(now) < ensure_utc(cooldown_until):
+                self._reject(session, run_id, now, candidate.symbol, "pump_symbol_cooldown")
+                continue
             next_open = self._next_open(candles_1h, candidate.symbol, next_time)
             if next_open is None or next_open <= 0:
                 self._reject(session, run_id, now, candidate.symbol, "pump_missing_next_open")
                 continue
+            if (
+                market.entry_mode == "patient"
+                and next_open > candidate.price * (1 + cfg.market_context_patient_max_entry_gap_pct)
+            ):
+                self._reject(session, run_id, now, candidate.symbol, "pump_patient_entry_gap")
+                continue
 
             stop_distance = max(candidate.atr * cfg.initial_stop_atr_multiple, next_open * cfg.initial_stop_pct)
-            # v2.5G equity peak scaling: reduce risk when below peak
+            if is_cold_squeeze:
+                stop_distance = min(stop_distance, next_open * cfg.cold_squeeze_initial_stop_pct)
+            active_pct = self._active_capital_pct(equity)
+            active_equity = equity * active_pct
             peak_ratio = equity / max(self._equity_high, 1)
             eff_risk_pct = cfg.trade_risk_pct
             if getattr(cfg, 'equity_peak_risk_enabled', False):
                 floor = getattr(cfg, 'equity_peak_risk_floor', 0.50)
                 eff_risk_pct *= max(floor, peak_ratio)
-            risk_budget = equity * eff_risk_pct * candidate.risk_multiplier
+            risk_budget = active_equity * eff_risk_pct * candidate.risk_multiplier
+            exposure_cap = cfg.max_total_exposure_pct * active_pct
             full_quantity = min(
                 risk_budget / stop_distance,
-                equity * cfg.max_symbol_position_pct / next_open,
-                equity * max(cfg.max_total_exposure_pct - pump_exposure, 0) / next_open,
+                active_equity * cfg.max_symbol_position_pct / next_open,
+                equity * max(exposure_cap - pump_exposure, 0) / next_open,
             )
             if full_quantity <= 0:
                 self._reject(session, run_id, now, candidate.symbol, "pump_exposure_limit")
                 continue
 
-            # v2.0: probe entry — A=50%, B=30% of full quantity
-            probe_pct = 0.50 if candidate.tier == "A" else 0.30
+            probe_pct = cfg.cold_squeeze_probe_pct if is_cold_squeeze else (cfg.probe_pct_a if candidate.tier == "A" else cfg.probe_pct_b)
+            stagnation_reentry_boosted = False
+            last_exit = self._pump_symbol_last_exit.get(candidate.symbol)
+            if cfg.stagnation_reentry_boost_enabled and last_exit is not None:
+                last_exit_time, last_exit_reason = last_exit
+                age_hours = (ensure_utc(now) - ensure_utc(last_exit_time)).total_seconds() / 3600
+                if (
+                    last_exit_reason == "pump_stagnation_exit"
+                    and 0 <= age_hours <= cfg.stagnation_reentry_boost_hours
+                ):
+                    boosted_probe_pct = (
+                        cfg.stagnation_reentry_probe_pct_a
+                        if candidate.tier == "A"
+                        else cfg.stagnation_reentry_probe_pct_b
+                    )
+                    probe_pct = max(probe_pct, boosted_probe_pct)
+                    stagnation_reentry_boosted = True
             quantity = full_quantity * probe_pct
+            if cfg.portfolio_open_risk_enabled:
+                probe_cap_pct = cfg.max_probe_open_risk_pct or cfg.max_portfolio_open_risk_pct
+                quantity = self._risk_capped_quantity(
+                    portfolio,
+                    prices,
+                    equity,
+                    quantity,
+                    stop_distance,
+                    probe_cap_pct,
+                )
             if quantity <= 0:
                 self._reject(session, run_id, now, candidate.symbol, "pump_probe_too_small")
                 continue
@@ -2031,9 +1891,6 @@ class ResearchBacktester:
                 candidate.atr,
                 next_time,
                 highest_price=order.filled_price,
-                entry_atr=candidate.atr,
-                entry_vr=candidate.volume_ratio,
-                position_type="pump",
                 stop_mechanism="pump_initial_stop",
                 stop_trigger="low_below_pump_initial_stop",
                 is_probe=True,
@@ -2042,8 +1899,11 @@ class ResearchBacktester:
                 probe_entry_price=order.filled_price,
                 avg_entry_price=order.filled_price,
                 entry_notional=order.quantity * order.filled_price,
+                core_qty=order.quantity,
                 ema20_dev_pct=candidate.ema20_dev_pct,
                 signal_wick_ratio=candidate.wick_ratio,
+                market_phase=market.phase,
+                exit_profile="cold_squeeze" if is_cold_squeeze else market.exit_profile,
             )
             portfolio.positions[candidate.symbol] = position
             orders.append(order)
@@ -2064,10 +1924,19 @@ class ResearchBacktester:
                             "entry_price": order.filled_price,
                             "probe_entry_price": order.filled_price,
                             "avg_entry_price": order.filled_price,
+                            "probe_pct": probe_pct,
+                            "cold_squeeze": is_cold_squeeze,
+                            "stagnation_reentry_boosted": stagnation_reentry_boosted,
+                            "active_capital_pct": active_pct,
                             "stop_anchor_price": order.filled_price,
                             "stop_price": stop_price,
                             "atr": candidate.atr,
                             "risk_multiplier": candidate.risk_multiplier,
+                            "market_phase": market.phase,
+                            "market_transition": market.transition,
+                            "market_entry_mode": market.entry_mode,
+                            "market_exit_profile": "cold_squeeze" if is_cold_squeeze else market.exit_profile,
+                            "market_risk_multiplier": market.risk_multiplier,
                             "ema20_dev_rank_2160h": candidate.ema20_dev_rank_2160h,
                             "bad_b_ema_vr_risk_reduced": (
                                 candidate.tier == "B"
@@ -2100,51 +1969,6 @@ class ResearchBacktester:
             )
             self._write_position(session, run_id, next_time, position, "pump_open", order.filled_price)
 
-    def _find_swaps(
-        self,
-        portfolio: Portfolio,
-        targets: list[TargetPosition],
-        factors: pd.DataFrame,
-    ) -> list[SwapRecommendation]:
-        """Find swap opportunities: sell weakening position for significantly stronger candidate."""
-        rc = self.config.risk
-        if not portfolio.positions or not targets:
-            return []
-
-        # Build score lookup
-        score_map: dict[str, float] = {}
-        if not factors.empty:
-            for row in factors.itertuples(index=False):
-                score_map[str(row.symbol)] = float(getattr(row, "final_score", getattr(row, "momentum_score", 0)))
-
-        swaps: list[SwapRecommendation] = []
-
-        for target in targets:
-            if target.symbol in portfolio.positions:
-                continue
-            buy_score = score_map.get(target.symbol, 0)
-            for sym, pos in portfolio.positions.items():
-                sell_score = score_map.get(sym, 0)
-                if sell_score <= 0 or buy_score <= 0:
-                    continue
-                advantage = buy_score / sell_score if sell_score > 0 else float("inf")
-
-                # Strong swap: new coin is Top 3 and significantly stronger
-                if advantage >= rc.swap_score_advantage:
-                    # Check position is weak enough to swap
-                    if pos.state in ("weakening", "failed"):
-                        swaps.append(SwapRecommendation(sym, target, 999, 1, sell_score, buy_score, "swap_strong"))
-                elif advantage >= rc.swap_strong_score_advantage:
-                    # Very strong signal — can swap even healthy positions
-                    swaps.append(SwapRecommendation(sym, target, 999, 1, sell_score, buy_score, "swap_very_strong"))
-
-                if len(swaps) >= rc.swap_max_per_day:
-                    break
-            if len(swaps) >= rc.swap_max_per_day:
-                break
-
-        return swaps
-
     def _next_open(self, candles: dict[str, pd.DataFrame], symbol: str, next_time: datetime) -> float | None:
         frame = candles.get(symbol, pd.DataFrame())
         if frame.empty:
@@ -2165,38 +1989,53 @@ class ResearchBacktester:
                 return float(matches["open"].iloc[0])
         return None
 
-    def _write_market_state(self, session: Session, run_id: int, now: datetime, state: MarketState) -> None:
-        session.add(
-            MarketStateRecord(
-                strategy_run_id=run_id,
-                time=now,
-                btc_close=state.btc_close,
-                btc_ma50=state.btc_ma50,
-                ma50_slope_4=state.ma50_slope_4,
-                breadth=state.breadth,
-                state=state.state,
-                fast_risk_valve=state.fast_risk_valve,
-                reasons=state.reasons,
-            )
-        )
+    @staticmethod
+    def _portfolio_open_risk(portfolio: Portfolio, prices: dict[str, float]) -> float:
+        risk = 0.0
+        for position in portfolio.positions.values():
+            price = prices.get(position.symbol, position.avg_entry_price or position.entry_price)
+            risk += position.quantity * max(float(price) - position.stop_price, 0.0)
+        return risk
 
-    def _write_factor_scores(self, session: Session, run_id: int, now: datetime, factors: pd.DataFrame) -> None:
-        for row in factors.head(10).itertuples(index=False):
-            raw = {key: float(getattr(row, key)) for key in factors.columns if key.startswith("return_") or key.startswith("weight_")}
-            volume_score = float(getattr(row, "volume_score", 0)) if hasattr(row, "volume_score") else None
-            trend_score = float(getattr(row, "trend_score", 0)) if hasattr(row, "trend_score") else None
-            session.add(
-                FactorScoreRecord(
-                    strategy_run_id=run_id,
-                    time=now,
-                    symbol=str(row.symbol),
-                    momentum_score=float(row.momentum_score),
-                    volume_score=volume_score,
-                    trend_score=trend_score,
-                    final_score=float(row.final_score),
-                    raw_factors=raw,
-                )
-            )
+    def _active_capital_pct(self, equity: float) -> float:
+        cfg = self.config.pump_mode
+        if not cfg.profit_reserve_enabled or equity <= 0:
+            return 1.0
+        profit_ratio = equity / max(self.config.backtest.initial_equity, 1)
+        if profit_ratio >= cfg.profit_reserve_profit_2_threshold:
+            profit_cap = cfg.profit_reserve_profit_2_active_cap
+        elif profit_ratio >= cfg.profit_reserve_profit_1_threshold:
+            profit_cap = cfg.profit_reserve_profit_1_active_cap
+        else:
+            return 1.0
+
+        drawdown = equity / max(self._equity_high, 1) - 1
+        if drawdown <= -0.30:
+            active_pct = cfg.profit_reserve_deep_dd_active_pct
+        elif drawdown <= -0.20:
+            active_pct = max(profit_cap, cfg.profit_reserve_dd_30_active_pct)
+        elif drawdown <= -0.10:
+            active_pct = max(profit_cap, cfg.profit_reserve_dd_20_active_pct)
+        else:
+            active_pct = min(profit_cap, cfg.profit_reserve_dd_10_active_pct)
+        return min(max(active_pct, 0.0), 1.0)
+
+    def _risk_capped_quantity(
+        self,
+        portfolio: Portfolio,
+        prices: dict[str, float],
+        equity: float,
+        requested_qty: float,
+        unit_risk: float,
+        cap_pct: float,
+    ) -> float:
+        if requested_qty <= 0 or unit_risk <= 0 or equity <= 0:
+            return 0.0
+        current_risk = self._portfolio_open_risk(portfolio, prices)
+        remaining_risk = equity * cap_pct - current_risk
+        if remaining_risk <= 0:
+            return 0.0
+        return min(requested_qty, remaining_risk / unit_risk)
 
     def _write_orders(
         self,
@@ -2262,22 +2101,3 @@ class ResearchBacktester:
 
     def _reject(self, session: Session, run_id: int, now: datetime, symbol: str, reason: str) -> None:
         session.add(RejectedSignalRecord(strategy_run_id=run_id, time=now, symbol=symbol, reason=reason, details=None))
-
-    def _synthetic_candles(self) -> dict[str, pd.DataFrame]:
-        index = pd.date_range("2024-01-01", periods=120, freq="h", tz="UTC")
-        data: dict[str, pd.DataFrame] = {}
-        for offset, symbol in enumerate(["AAA/USDT", "BBB/USDT", "CCC/USDT", "DDD/USDT"], start=1):
-            close = pd.Series(range(100 + offset, 220 + offset), dtype=float) * (1 + offset * 0.001)
-            frame = pd.DataFrame(
-                {
-                    "open_time": index,
-                    "open": close.shift(1).fillna(close.iloc[0]),
-                    "high": close + 1,
-                    "low": close - 1,
-                    "close": close,
-                    "volume": 1000,
-                    "quote_volume": close * 1000,
-                }
-            )
-            data[symbol] = frame
-        return data

@@ -1,14 +1,11 @@
 database_url: postgresql+psycopg://crypto_quant:crypto_quant@localhost:5439/crypto_quant
 exchange_id: binance
-strategy_version: v1.4.2
+strategy_version: pump-v1
 base_currency: USDT
 timeframes:
   primary: 1h
-  trend: 4h
+
 universe:
-  top_n: 60
-  min_quote_volume_30d: 10000000
-  # Mega-cap exclusion — keep BTC for market state, trade only altcoins
   mega_cap_exclude:
     - BTC
     - ETH
@@ -42,7 +39,6 @@ universe:
     - DOWN
     - BULL
     - BEAR
-    # Quasi-stablecoins and non-crypto instruments
     - USD1
     - USDE
     - USR
@@ -53,61 +49,159 @@ universe:
     - XAUT
     - BFUSD
     - FRAX
+
 risk:
-  trade_risk_pct: 0.01
-  max_symbol_position_pct: 0.35
-  max_positions: 3
-  atr_period: 14
-  atr_stop_multiple: 2.0
-  max_single_volatility_risk_pct: 0.03
-  max_portfolio_stop_risk_pct: 0.03
-  max_portfolio_volatility_risk_pct: 0.06
-  # v1: breakeven / trailing stop parameters tuned from backtest data
-  # breakeven at 2x ATR (was 1x — too tight, caused 4h median hold)
-  # trailing at 2x ATR from high (was 3x — too wide, missed profits)
-  enable_breakeven_stop: true
-  breakeven_activation_atr_multiple: 2.0
-  breakeven_buffer_bps: 0.0
-  enable_trailing_stop: true
-  trailing_activation_atr_multiple: 2.0
-  trailing_stop_atr_multiple: 3.5
-  defensive_tighten_existing_positions: true
-  defensive_tighten_atr_multiple: 1.0
-  # v1: volume confirmation disabled — backtest shows it filters out positive-alpha signals
-  volume_confirmation_enabled: false
-  volume_confirmation_lookback_hours: 6
-  volume_confirmation_average_hours: 20
-  volume_confirmation_min_ratio: 1.0
-  # v1: daily loss circuit breaker
-  daily_loss_limit_pct: 0.12
-  daily_loss_defensive_pct: 0.18
-  consecutive_loss_pause_count: 15
-  consecutive_loss_pause_hours: 0.5
-  recent_trades_lookback: 25
-  recent_trades_loss_threshold: 18
-  # v1: volume-stall filter (white paper §5.4)
-  volume_stall_enabled: true
-  volume_stall_lookback_bars: 6
-  volume_stall_volume_lookback_hours: 20
-  volume_stall_volume_ratio: 1.5
-  volume_stall_min_bars_above: 4
-  volume_stall_high_rejection_pct: 0.995
-  volume_stall_return_threshold: 0.015
-  volume_stall_drawdown_threshold: 0.015
-  volume_stall_top_return_pct: 0.2
-  cooldown_hours: 4.0
-  # v1: position state machine — weakening reduces position
-  weakening_reduction_pct: 0.33
-  weakening_trailing_multiple: 1.5
+  blowoff_wick_ratio: 0.6
+
 market_state:
   btc_symbol: BTC/USDT
-  ma_period: 50
-  slope_lookback_bars: 4
-  bearish_slope_threshold: -0.005
-  breadth_threshold: 0.5
+
 momentum:
   windows_hours: [4, 24, 48, 72]
   weights: [0.25, 0.35, 0.25, 0.15]
+
+pump_mode:
+  enabled: true
+  max_positions: 2
+  trade_risk_pct: 0.05
+  max_symbol_position_pct: 0.60
+  max_total_exposure_pct: 1.00
+  min_24h_return: 0.32
+  min_72h_return: 0.35
+  min_6h_return: 0.10
+  early_6h_return: 0.08
+  min_quote_volume_24h: 2000000
+  min_quote_volume_6h: 800000
+  volume_ratio_min: 1.5
+  early_volume_ratio_min: 1.8
+  warm_early_6h_return: 0.12
+  warm_early_volume_ratio_min: 2.0
+  max_72h_return_full_risk: 0.80
+  max_72h_return_reduced_risk: 2.20
+  max_72h_return_chase: 3.50
+  max_72h_return_entry: 3.50
+  reduced_risk_multiplier: 0.70
+  late_chase_risk_multiplier: 0.40
+  initial_stop_atr_multiple: 1.8
+  initial_stop_pct: 0.10
+  probe_pct_a: 0.50
+  probe_pct_b: 0.30
+  probe_confirm_target_pct_a: 1.00
+  probe_confirm_target_pct_b: 1.00
+  portfolio_open_risk_enabled: false
+  max_portfolio_open_risk_pct: 0.10
+  max_probe_open_risk_pct:
+  bad_b_ema_rank_min: 0.95
+  bad_b_volume_ratio_min: 30.0
+  bad_b_volume_ratio_mid_min: 15.0
+  bad_b_volume_ratio_mid_max: 30.0
+  bad_b_risk_multiplier_mid: 0.75
+  bad_b_ema_vr_risk_mid_enabled: true
+  bad_b_vr30_reject_enabled: true
+  mfe_protect_enabled: true
+  mfe_protect_15pct_mult: 1.005
+  mfe_protect_25pct_mult: 1.03
+  mfe_protect_40pct_mult: 1.08
+  ema_abs_min_enabled: false
+  ema_abs_max_enabled: false
+  reject_long_wick_enabled: false
+  reject_accel_decay_enabled: false
+  exit_confidence_enabled: false
+  scaled_avg_floor_enabled: false
+  scaled_avg_floor_mfe_pct: 0.10
+  early_probe_fail_enabled: false
+  early_probe_fail_hours: 2.0
+  early_probe_fail_ret_pct: -0.06
+  early_probe_fail_mfe_max_pct: 0.02
+  staged_confirm_enabled: false
+  staged_confirm_strong_mfe_pct: 0.10
+  staged_confirm_strong_ret_pct: 0.05
+  staged_confirm_weak_target_pct_a: 0.70
+  staged_confirm_weak_target_pct_b: 0.70
+  two_stage_confirm_enabled: false
+  two_stage_weak_target_pct: 0.55
+  two_stage_strong_target_pct: 1.00
+  two_stage_strong_mfe_pct: 0.12
+  two_stage_strong_ret_pct: 0.06
+  add_tranche_exit_enabled: false
+  add_tranche_fail_hours: 2.0
+  add_tranche_fail_mfe_pct: 0.05
+  add_tranche_fail_ret_pct: 0.005
+  add_tranche_stop_pct: -0.02
+  add_tranche_stagnation_first_enabled: false
+  failed_reentry_cooldown_enabled: false
+  failed_reentry_cooldown_hours: 24.0
+  failed_reentry_exit_reasons:
+    - pump_probe_kill
+    - pump_3h_down
+  stagnation_reentry_boost_enabled: false
+  stagnation_reentry_boost_hours: 168.0
+  stagnation_reentry_probe_pct_a: 0.70
+  stagnation_reentry_probe_pct_b: 0.50
+  profit_reserve_enabled: false
+  profit_reserve_dd_10_active_pct: 0.70
+  profit_reserve_dd_20_active_pct: 0.80
+  profit_reserve_dd_30_active_pct: 0.90
+  profit_reserve_deep_dd_active_pct: 1.00
+  profit_reserve_profit_1_threshold: 1.50
+  profit_reserve_profit_1_active_cap: 0.85
+  profit_reserve_profit_2_threshold: 2.50
+  profit_reserve_profit_2_active_cap: 0.75
+  cold_squeeze_enabled: false
+  cold_squeeze_min_24h_return: 0.50
+  cold_squeeze_min_72h_return: 0.25
+  cold_squeeze_max_72h_return: 1.25
+  cold_squeeze_min_quote_volume_24h: 150000000
+  cold_squeeze_min_volume_ratio: 1.5
+  cold_squeeze_max_volume_ratio: 30.0
+  cold_squeeze_min_ema20_dev_pct: 8.0
+  cold_squeeze_max_ema20_dev_pct: 45.0
+  cold_squeeze_max_wick_ratio: 0.65
+  cold_squeeze_max_24h_return: 1.20
+  cold_squeeze_min_ret6_to_ret24: 0.10
+  cold_squeeze_risk_multiplier: 0.70
+  cold_squeeze_probe_pct: 0.20
+  cold_squeeze_max_positions: 1
+  cold_squeeze_initial_stop_pct: 0.06
+  cold_squeeze_confirm_enabled: true
+  cold_squeeze_confirm_mfe_pct: 0.15
+  cold_squeeze_confirm_target_pct: 0.50
+  cold_squeeze_fail_hours: 3.0
+  cold_squeeze_fail_mfe_pct: 0.10
+  cold_squeeze_fail_ret_pct: -0.03
+  equity_peak_risk_enabled: true
+  equity_peak_risk_floor: 0.70
+  trailing_1_profit_pct: 0.60
+  trailing_1_atr_multiple: 2.5
+  trailing_2_profit_pct: 1.00
+  trailing_2_atr_multiple: 2.0
+  trailing_3_profit_pct: 1.80
+  trailing_3_atr_multiple: 1.5
+  time_stop_hours: 12.0
+  time_stop_min_profit_pct: 0.0
+  stagnation_stop_hours: 6.0
+  stagnation_min_mfe_pct: 0.08
+  max_daily_loss_pct: 0.15
+  regime_hot_24h_return_pct: 0.05
+  regime_hot_new_high_ratio: 0.20
+  regime_hot_volume_expansion_ratio: 1.5
+  regime_warm_24h_return_pct: 0.02
+  regime_warm_new_high_ratio: 0.10
+  adaptive_risk_enabled: false
+  adaptive_risk_lookback: 20
+  adaptive_risk_min_multiplier: 0.25
+  market_context_enabled: true
+  market_context_min_history: 30
+  market_context_normal_risk_multiplier: 1.00
+  market_context_crowded_hot_risk_multiplier: 1.00
+  market_context_crowded_fading_risk_multiplier: 1.00
+  market_context_patient_max_entry_gap_pct: 999.0
+  market_context_exit_tightening_enabled: false
+  market_context_fading_extreme_multiplier: 1.00
+  market_context_fading_ema20_dev_pct: 18.0
+  market_context_fading_volume_ratio: 13.0
+  market_context_fading_ret_6h: 0.23
+
 backtest:
   initial_equity: 100000
   fee_bps: 10

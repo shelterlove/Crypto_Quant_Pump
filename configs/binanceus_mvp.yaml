@@ -1,4 +1,0 @@
-extends: configs/mvp.yaml
-exchange_id: binanceus
-universe:
-  min_quote_volume_30d: 0

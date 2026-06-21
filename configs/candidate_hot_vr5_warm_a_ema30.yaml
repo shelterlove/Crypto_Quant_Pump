@@ -1,0 +1,8 @@
+extends: configs/v1_pg.yaml
+strategy_version: pump-v1-hotvr5-waema30
+
+pump_mode:
+  reject_hot_confirmed_high_volume_enabled: true
+  reject_hot_confirmed_high_volume_ratio: 5.0
+  warm_a_high_ema_downgrade_enabled: true
+  warm_a_high_ema_downgrade_pct: 30.0

@@ -9,9 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crypto_quant.storage.models import (
-    Candle,
     EquityCurveRecord,
-    FactorScoreRecord,
     OrderRecord,
     PositionRecord,
     RejectedSignalRecord,
@@ -43,10 +41,7 @@ class BacktestReportWriter:
             "equity_curve": self._table(session, EquityCurveRecord, strategy_run_id),
             "signals": self._table(session, SignalRecord, strategy_run_id),
             "rejected_signals": self._table(session, RejectedSignalRecord, strategy_run_id),
-            "factor_scores_top": self._table(session, FactorScoreRecord, strategy_run_id),
         }
-        signal_quality = self._signal_quality_frames(session, run, frames)
-        frames.update(signal_quality)
         for name, frame in frames.items():
             frame.to_csv(out_dir / f"{name}.csv", index=False)
         html = out_dir / "report.html"
@@ -85,9 +80,6 @@ class BacktestReportWriter:
         equity = frames["equity_curve"]
         orders = frames["orders"]
         rejected = frames["rejected_signals"]
-        forward_returns = frames.get("signal_quality_forward_returns", pd.DataFrame())
-        rejected_returns = frames.get("rejected_signal_forward_returns", pd.DataFrame())
-        false_breakouts = frames.get("false_breakout_diagnostics", pd.DataFrame())
         exit_breakdown = self._exit_mechanism_breakdown(orders)
         start_equity = float(equity["equity"].iloc[0]) if not equity.empty else float(run.config["backtest"]["initial_equity"])
         final_equity = float(equity["equity"].iloc[-1]) if not equity.empty else start_equity
@@ -102,17 +94,6 @@ class BacktestReportWriter:
             rejected["reason"].value_counts().to_frame("count").reset_index().to_html(index=False)
             if not rejected.empty
             else "<p>No rejected signals.</p>"
-        )
-        forward_table = (
-            forward_returns.to_html(index=False) if not forward_returns.empty else "<p>No forward-return diagnostics.</p>"
-        )
-        rejected_table = (
-            rejected_returns.to_html(index=False) if not rejected_returns.empty else "<p>No rejected-signal diagnostics.</p>"
-        )
-        breakout_table = (
-            false_breakouts.head(50).to_html(index=False)
-            if not false_breakouts.empty
-            else "<p>No false-breakout diagnostics.</p>"
         )
         exit_table = exit_breakdown.to_html(index=False) if not exit_breakdown.empty else "<p>No exit-mechanism diagnostics.</p>"
         equity_rows = self._svg_polyline(equity, "equity") if not equity.empty else ""
@@ -135,7 +116,7 @@ class BacktestReportWriter:
   </style>
 </head>
 <body>
-  <h1>MVP Backtest Report</h1>
+  <h1>Pump Backtest Report</h1>
   <p>Run ID: {run.id} | Exchange: {exchange} | Strategy: {run.strategy_version} | Status: {run.status}</p>
   <div class="warning">
     Survivorship bias risk: true. This first pass uses current Binance spot symbols
@@ -162,202 +143,20 @@ class BacktestReportWriter:
   {rejection_stats}
   <h2>Exit Mechanism Breakdown</h2>
   {exit_table}
-  <h2>Signal Quality</h2>
-  <h3>Top Signal Forward Returns</h3>
-  {forward_table}
-  <h3>Rejected Signal Forward Returns</h3>
-  {rejected_table}
-  <h3>False Breakout Diagnostics</h3>
-  {breakout_table}
-  <h2>Whitepaper Coverage Notes</h2>
+  <h2>Strategy Coverage Notes</h2>
   <ul>
     <li>
-      Implemented: 1H/4H closed candles, weekly universe, BTC 4H MA50 filter,
-      breadth, raw momentum Top3, 1H ATR sizing, basic ATR stop, fees and slippage.
+      Implemented: 1H closed candles, pump market regime, pump candidate filters,
+      ATR/percent initial stop, probe-and-confirm sizing, trailing exits, fees and slippage.
     </li>
     <li>
-      Not implemented in this pass: 15m fast-risk condition, order book depth filter,
-      full volume/trend factors, volume-stall filter,
-      delisted-symbol backfill.
+      Remaining: survivorship-free historical universe, intrabar execution replay,
+      delisting shocks, partial fills and exchange latency.
     </li>
   </ul>
 </body>
 </html>
 """
-
-    def _signal_quality_frames(
-        self,
-        session: Session,
-        run: StrategyRun,
-        frames: dict[str, pd.DataFrame],
-    ) -> dict[str, pd.DataFrame]:
-        factors = frames["factor_scores_top"]
-        rejected = frames["rejected_signals"]
-        exchange = str(run.config.get("exchange_id", "binance"))
-        start = self._run_start(factors, rejected)
-        end = self._run_end(factors, rejected)
-        if start is None or end is None:
-            return {
-                "signal_quality_forward_returns": pd.DataFrame(),
-                "rejected_signal_forward_returns": pd.DataFrame(),
-                "false_breakout_diagnostics": pd.DataFrame(),
-            }
-        horizons = [1, 4, 12, 24, 48, 72]
-        symbols = sorted(
-            set(factors.get("symbol", pd.Series(dtype=str)).astype(str))
-            | set(rejected.get("symbol", pd.Series(dtype=str)).astype(str))
-        )
-        candles = self._load_candle_frame(session, exchange, symbols, start, end + pd.Timedelta(hours=max(horizons)))
-        top_returns = self._top_forward_returns(factors, candles, horizons)
-        rejected_returns = self._rejected_forward_returns(rejected, candles, horizons)
-        breakouts = self._false_breakout_diagnostics(factors, candles)
-        return {
-            "signal_quality_forward_returns": top_returns,
-            "rejected_signal_forward_returns": rejected_returns,
-            "false_breakout_diagnostics": breakouts,
-        }
-
-    def _run_start(self, *frames: pd.DataFrame) -> pd.Timestamp | None:
-        times = [pd.to_datetime(frame["time"], utc=True).min() for frame in frames if not frame.empty and "time" in frame]
-        return min(times) if times else None
-
-    def _run_end(self, *frames: pd.DataFrame) -> pd.Timestamp | None:
-        times = [pd.to_datetime(frame["time"], utc=True).max() for frame in frames if not frame.empty and "time" in frame]
-        return max(times) if times else None
-
-    def _load_candle_frame(
-        self,
-        session: Session,
-        exchange: str,
-        symbols: list[str],
-        start: pd.Timestamp,
-        end: pd.Timestamp,
-    ) -> pd.DataFrame:
-        if not symbols:
-            return pd.DataFrame()
-        rows = session.execute(
-            select(Candle.symbol, Candle.open_time, Candle.open, Candle.high, Candle.low, Candle.close)
-            .where(Candle.exchange == exchange)
-            .where(Candle.symbol.in_(symbols))
-            .where(Candle.timeframe == "1h")
-            .where(Candle.open_time >= start.to_pydatetime())
-            .where(Candle.open_time <= end.to_pydatetime())
-            .order_by(Candle.symbol, Candle.open_time)
-        ).all()
-        return pd.DataFrame(
-            [
-                {
-                    "symbol": symbol,
-                    "open_time": open_time,
-                    "open": float(open_price),
-                    "high": float(high),
-                    "low": float(low),
-                    "close": float(close),
-                }
-                for symbol, open_time, open_price, high, low, close in rows
-            ]
-        )
-
-    def _top_forward_returns(self, factors: pd.DataFrame, candles: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
-        if factors.empty or candles.empty:
-            return pd.DataFrame()
-        ranked = factors.copy()
-        ranked["time"] = pd.to_datetime(ranked["time"], utc=True)
-        ranked["rank"] = ranked.groupby("time")["final_score"].rank(method="first", ascending=False)
-        rows: list[dict[str, object]] = []
-        for bucket in [3, 5, 10]:
-            selected = ranked[ranked["rank"] <= bucket]
-            for horizon in horizons:
-                returns = [
-                    item
-                    for item in (
-                        self._forward_return(candles, str(row.symbol), row.time, horizon)
-                        for row in selected.itertuples(index=False)
-                    )
-                    if item is not None
-                ]
-                rows.append(
-                    {
-                        "bucket": f"top{bucket}",
-                        "horizon_hours": horizon,
-                        "samples": len(returns),
-                        "mean_return_pct": sum(returns) / len(returns) * 100 if returns else 0,
-                        "win_rate": sum(1 for value in returns if value > 0) / len(returns) if returns else 0,
-                    }
-                )
-        return pd.DataFrame(rows)
-
-    def _rejected_forward_returns(self, rejected: pd.DataFrame, candles: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
-        if rejected.empty or candles.empty:
-            return pd.DataFrame()
-        rejected = rejected.copy()
-        rejected["time"] = pd.to_datetime(rejected["time"], utc=True)
-        rows: list[dict[str, object]] = []
-        for reason, group in rejected.groupby("reason"):
-            for horizon in horizons:
-                returns = [
-                    item
-                    for item in (
-                        self._forward_return(candles, str(row.symbol), row.time, horizon)
-                        for row in group.itertuples(index=False)
-                    )
-                    if item is not None
-                ]
-                rows.append(
-                    {
-                        "reason": reason,
-                        "horizon_hours": horizon,
-                        "samples": len(returns),
-                        "mean_return_pct": sum(returns) / len(returns) * 100 if returns else 0,
-                        "win_rate": sum(1 for value in returns if value > 0) / len(returns) if returns else 0,
-                    }
-                )
-        return pd.DataFrame(rows)
-
-    def _false_breakout_diagnostics(self, factors: pd.DataFrame, candles: pd.DataFrame) -> pd.DataFrame:
-        if factors.empty or candles.empty:
-            return pd.DataFrame()
-        ranked = factors.copy()
-        ranked["time"] = pd.to_datetime(ranked["time"], utc=True)
-        ranked["rank"] = ranked.groupby("time")["final_score"].rank(method="first", ascending=False)
-        rows: list[dict[str, object]] = []
-        for row in ranked[ranked["rank"] <= 10].itertuples(index=False):
-            window = self._future_window(candles, str(row.symbol), row.time, 24)
-            if len(window) < 2:
-                continue
-            base_close = float(window["close"].iloc[0])
-            final_close = float(window["close"].iloc[-1])
-            mfe = float(window["high"].max()) / base_close - 1 if base_close else 0
-            mae = float(window["low"].min()) / base_close - 1 if base_close else 0
-            final_return = final_close / base_close - 1 if base_close else 0
-            rows.append(
-                {
-                    "time": row.time,
-                    "symbol": row.symbol,
-                    "rank": int(row.rank),
-                    "mfe_24h_pct": mfe * 100,
-                    "mae_24h_pct": mae * 100,
-                    "return_24h_pct": final_return * 100,
-                    "surged_then_reverted": bool(mfe > 0 and final_return <= max(0, mfe * 0.25)),
-                }
-            )
-        return pd.DataFrame(rows)
-
-    def _forward_return(self, candles: pd.DataFrame, symbol: str, time: pd.Timestamp, horizon_hours: int) -> float | None:
-        window = self._future_window(candles, symbol, time, horizon_hours)
-        if len(window) < 2:
-            return None
-        start_close = float(window["close"].iloc[0])
-        end_close = float(window["close"].iloc[-1])
-        return end_close / start_close - 1 if start_close else None
-
-    def _future_window(self, candles: pd.DataFrame, symbol: str, time: pd.Timestamp, horizon_hours: int) -> pd.DataFrame:
-        symbol_candles = candles[candles["symbol"] == symbol].copy()
-        if symbol_candles.empty:
-            return symbol_candles
-        symbol_candles["open_time"] = pd.to_datetime(symbol_candles["open_time"], utc=True)
-        end = time + pd.Timedelta(hours=horizon_hours)
-        return symbol_candles[(symbol_candles["open_time"] >= time) & (symbol_candles["open_time"] <= end)].sort_values("open_time")
 
     def _trade_stats(self, orders: pd.DataFrame) -> dict[str, float | int]:
         if orders.empty:
@@ -423,7 +222,7 @@ class BacktestReportWriter:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Crypto Quant MVP Pipeline Overview</title>
+  <title>Crypto Quant Pump Pressure Overview</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 32px; color: #1f2933; }}
     table {{ border-collapse: collapse; width: 100%; margin-top: 12px; }}
@@ -432,7 +231,7 @@ class BacktestReportWriter:
   </style>
 </head>
 <body>
-  <h1>One-Year MVP Pipeline Overview</h1>
+  <h1>Pump Pressure Overview</h1>
   <p>Run IDs: {", ".join(str(run_id) for run_id in run_ids)}</p>
   <div class="warning">
     Survivorship bias risk: true. This first pass uses current Binance spot symbols
@@ -442,16 +241,15 @@ class BacktestReportWriter:
   {table}
   <h2>Data Coverage Warnings</h2>
   <ul>{warning_items}</ul>
-  <h2>Whitepaper Coverage Notes</h2>
+  <h2>Strategy Coverage Notes</h2>
   <ul>
     <li>
-      Implemented: 1H/4H closed candles, weekly universe, BTC 4H MA50 filter,
-      breadth, raw momentum Top3, 1H ATR sizing, basic ATR stop, fees and slippage.
+      Implemented: 1H closed candles, pump market regime, pump candidate filters,
+      ATR/percent initial stop, probe-and-confirm sizing, trailing exits, fees and slippage.
     </li>
     <li>
-      Not implemented in this pass: 15m fast-risk condition, order book depth filter,
-      full volume/trend factors, volume-stall filter, trailing take-profit,
-      delisted-symbol backfill.
+      Remaining: survivorship-free historical universe, intrabar execution replay,
+      delisting shocks, partial fills and exchange latency.
     </li>
   </ul>
 </body>

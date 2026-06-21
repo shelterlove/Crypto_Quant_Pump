@@ -1,0 +1,11 @@
+extends: configs/candidate_hot_vr5_warm_a_ema30.yaml
+strategy_version: pump-v1-2stage-p25w50
+
+pump_mode:
+  probe_pct_a: 0.25
+  probe_pct_b: 0.25
+  two_stage_confirm_enabled: true
+  two_stage_weak_target_pct: 0.50
+  two_stage_strong_target_pct: 1.00
+  two_stage_strong_mfe_pct: 0.12
+  two_stage_strong_ret_pct: 0.06

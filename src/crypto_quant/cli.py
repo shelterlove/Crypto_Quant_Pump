@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -12,24 +11,21 @@ from alembic import command
 from crypto_quant.backtest.runner import ResearchBacktester
 from crypto_quant.config.settings import load_config
 from crypto_quant.data.sync import CandleSyncService
-from crypto_quant.pipeline import PipelineError, RunOneYearMvpPipeline
+from crypto_quant.paper.cycle import PaperCycleDataStale, PaperCycleLocked, PaperCycleRunner
+from crypto_quant.paper.runner import PaperRunner
 from crypto_quant.reporting import BacktestReportWriter
-from crypto_quant.storage.candles import distinct_candle_symbols
 from crypto_quant.storage.database import get_session_factory
-from crypto_quant.universe.service import WeeklyUniverseService
 from crypto_quant.utils.time import default_one_year_window, parse_utc_datetime
 
 app = typer.Typer(help="Crypto quant research framework.")
 db_app = typer.Typer(help="Database commands.")
 data_app = typer.Typer(help="Market data commands.")
-universe_app = typer.Typer(help="Universe commands.")
 backtest_app = typer.Typer(help="Backtest commands.")
-pipeline_app = typer.Typer(help="End-to-end research pipelines.")
+paper_app = typer.Typer(help="Local paper trading commands.")
 app.add_typer(db_app, name="db")
 app.add_typer(data_app, name="data")
-app.add_typer(universe_app, name="universe")
 app.add_typer(backtest_app, name="backtest")
-app.add_typer(pipeline_app, name="pipeline")
+app.add_typer(paper_app, name="paper")
 
 
 @db_app.command("upgrade")
@@ -39,7 +35,7 @@ def db_upgrade(revision: str = "head") -> None:
 
 @data_app.command("sync-candles")
 def sync_candles(
-    config: Path = Path("configs/mvp.yaml"),
+    config: Path = Path("configs/v1.yaml"),
     symbols: Annotated[list[str] | None, typer.Option("--symbol")] = None,
     timeframe: str = "1h",
     start: str | None = None,
@@ -73,50 +69,17 @@ def sync_candles(
         )
 
 
-@universe_app.command("build")
-def build_universe(
-    config: Path = Path("configs/mvp.yaml"),
-    symbols: Annotated[list[str] | None, typer.Option("--symbol")] = None,
-    start: str | None = None,
-    end: str | None = None,
-    dry_run: bool = False,
-) -> None:
-    cfg = load_config(config)
-    default_start, default_end = default_one_year_window()
-    start_dt = parse_utc_datetime(start, default_start)
-    end_dt = parse_utc_datetime(end, default_end)
-    session_factory = get_session_factory(cfg.database_url)
-    with session_factory() as session:
-        selected = symbols or distinct_candle_symbols(session, cfg.exchange_id, "1d")
-        if not selected:
-            raise typer.BadParameter("no 1d candle symbols found; run data sync-candles first")
-        result = WeeklyUniverseService(cfg).build(session, selected, start_dt, end_dt, persist=not dry_run)
-        if not dry_run:
-            session.commit()
-    typer.echo(f"weekly_snapshots={len(result.snapshots)} candidate_union={len(result.candidate_union)}")
-    for snapshot in result.snapshots[:8]:
-        typer.echo(f"{snapshot.effective_from.date()}: {len(snapshot.symbols)} symbols")
-
-
 @backtest_app.command("run")
 def run_backtest(
-    config: Path = Path("configs/mvp.yaml"),
+    config: Path = Path("configs/v1.yaml"),
     start: str | None = None,
     end: str | None = None,
-    write_db: bool = True,
     report_dir: Path = Path("reports"),
 ) -> None:
     cfg = load_config(config)
     default_start, default_end = default_one_year_window()
     start_dt = parse_utc_datetime(start, default_start)
     end_dt = parse_utc_datetime(end, default_end)
-    if not write_db:
-        result = ResearchBacktester(cfg).run_synthetic()
-        typer.echo(
-            f"completed synthetic: run_id={result.strategy_run_id} "
-            f"orders={len(result.orders)} final_equity={result.final_equity:.2f}"
-        )
-        return
     session_factory = get_session_factory(cfg.database_url)
     with session_factory() as session:
         result = ResearchBacktester(cfg).run_real(session, start_dt, end_dt)
@@ -132,7 +95,7 @@ def run_backtest(
 
 @backtest_app.command("pressure-test")
 def pressure_test(
-    config: Path = Path("configs/mvp.yaml"),
+    config: Path = Path("configs/v1.yaml"),
     start: str | None = None,
     end: str | None = None,
     report_dir: Path = Path("reports"),
@@ -155,64 +118,77 @@ def pressure_test(
             )
 
 
-@data_app.command("sync-one-year-mvp")
-def sync_one_year_mvp(config: Path = Path("configs/mvp.yaml"), dry_run: bool = False) -> None:
-    cfg = load_config(config)
-    start, end = default_one_year_window(datetime.now(UTC))
-    daily_start = start - timedelta(days=30)
-    typer.echo("Step 1: sync all USDT spot 1d for liquidity screening")
-    typer.echo(f"start={daily_start} end={end} dry_run={dry_run}")
-    typer.echo("Step 2: build weekly universe from 1d data")
-    typer.echo("Step 3: sync 1h/4h for weekly Top60 union + BTC")
-    typer.echo(f"database={cfg.database_url}")
-
-
-@pipeline_app.command("run-one-year-mvp")
-def run_one_year_mvp(
-    config: Path = Path("configs/mvp.yaml"),
-    start: str | None = None,
-    end: str | None = None,
+@paper_app.command("run")
+def run_paper(
+    config: Path = Path("configs/main.yaml"),
+    state_path: Path = Path("paper_state/main.json"),
     report_dir: Path = Path("reports"),
-    dry_run: bool = False,
+    lookback_days: int = 120,
 ) -> None:
     cfg = load_config(config)
-    default_start, default_end = default_one_year_window()
-    start_dt = parse_utc_datetime(start, default_start) if start else None
-    end_dt = parse_utc_datetime(end, default_end) if end else None
-    pipeline = RunOneYearMvpPipeline(cfg, report_writer=BacktestReportWriter(report_dir))
-    if dry_run:
-        result = pipeline.build_dry_run(start_dt, end_dt)
-    else:
-        session_factory = get_session_factory(cfg.database_url)
-        try:
-            with session_factory() as session:
-                result = pipeline.run(session, start_dt, end_dt)
-        except PipelineError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-    typer.echo(f"window: start={result.start.isoformat()} end={result.end.isoformat()} daily_start={result.daily_start.isoformat()}")
-    for index, step in enumerate(result.steps, start=1):
-        typer.echo(f"{index}. {step.name}: {step.detail}")
-    for quality in result.data_quality:
-        typer.echo(
-            f"coverage {quality.timeframe}: symbols={quality.symbol_count} "
-            f"rows={quality.row_count} missing={quality.missing_intervals}"
-        )
-    for warning in result.warnings:
-        typer.echo(f"warning: {warning}")
-    if result.run_summaries:
-        typer.echo("runs:")
-        for summary in result.run_summaries:
-            typer.echo(
-                f"  {summary.label}: run_id={summary.run_id} "
-                f"final_equity={summary.final_equity:.2f} report={summary.report_html}"
-            )
-    if result.overview is not None:
-        typer.echo(f"overview_html={result.overview.html}")
-        if result.overview.csv is not None:
-            typer.echo(f"overview_csv={result.overview.csv}")
-    if dry_run:
-        typer.echo("dry-run: no database, Binance, or backtest work executed")
+    session_factory = get_session_factory(cfg.database_url)
+    with session_factory() as session:
+        result = PaperRunner(cfg, state_path=state_path, lookback_days=lookback_days).run_once(session)
+        session.commit()
+        report_path = None
+        if result.strategy_run_id is not None:
+            report_path = BacktestReportWriter(report_dir).write(session, result.strategy_run_id).html
+            session.commit()
+    if result.skipped:
+        typer.echo(f"paper skipped: {result.reason} state={result.state_path}")
+        return
     typer.echo(
-        "whitepaper_not_covered: 15m fast-risk valve, order book depth, full volume/trend factors, "
-        "volume-stall filter, delisted-symbol backfill"
+        f"paper completed: run_id={result.strategy_run_id} orders={len(result.orders)} "
+        f"signal_time={result.processed_signal_time} fill_time={result.fill_time} "
+        f"equity={result.equity:.2f} state={result.state_path} report={report_path}"
+    )
+
+
+@paper_app.command("cycle")
+def run_paper_cycle(
+    config: Path = Path("configs/main.yaml"),
+    state_path: Path = Path("paper_state/main.json"),
+    lock_path: Path = Path("paper_state/paper.lock"),
+    report_dir: Path = Path("reports"),
+    lookback_days: int = 120,
+    sync_lookback_hours: int = 6,
+    max_staleness_hours: int = 2,
+    settle_minutes: int = 3,
+    all_usdt_spot: bool = False,
+    skip_sync: bool = False,
+    allow_stale: bool = False,
+    json_output: bool = False,
+) -> None:
+    cfg = load_config(config)
+    session_factory = get_session_factory(cfg.database_url)
+    runner = PaperCycleRunner(
+        cfg,
+        state_path=state_path,
+        lock_path=lock_path,
+        report_dir=report_dir,
+        lookback_days=lookback_days,
+        sync_lookback_hours=sync_lookback_hours,
+        max_staleness_hours=max_staleness_hours,
+        settle_minutes=settle_minutes,
+        all_usdt_spot=all_usdt_spot,
+        skip_sync=skip_sync,
+        allow_stale=allow_stale,
+    )
+    try:
+        with session_factory() as session:
+            result = runner.run(session)
+    except PaperCycleLocked as exc:
+        typer.echo(f"paper cycle skipped: {exc}", err=True)
+        raise typer.Exit(code=75) from exc
+    except PaperCycleDataStale as exc:
+        typer.echo(f"paper cycle failed: {exc}", err=True)
+        raise typer.Exit(code=70) from exc
+    if json_output:
+        typer.echo(result.to_json())
+        return
+    typer.echo(
+        f"paper cycle {result.status}: run_id={result.run_id} orders={result.orders} "
+        f"equity={result.equity:.2f} synced_rows={result.synced_rows} sync_errors={result.sync_errors} "
+        f"latest={result.latest_candle_time} expected={result.expected_candle_time} lag_seconds={result.lag_seconds} "
+        f"state={result.state_path} report={result.report_path} reason={result.reason}"
     )

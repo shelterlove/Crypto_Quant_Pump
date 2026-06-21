@@ -16,6 +16,7 @@ htmlcov/
 
 # Runtime data and generated outputs
 reports/
+paper_state/
 freqtrade_user_data/logs/
 *.db
 *.sqlite

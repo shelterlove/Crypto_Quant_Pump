@@ -1,0 +1,2 @@
+extends: configs/candidate_combo_two_stage_probe25_weak50.yaml
+strategy_version: pump-v1-main
