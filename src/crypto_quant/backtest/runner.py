@@ -290,6 +290,7 @@ class ResearchBacktester:
                     market,
                 )
 
+                self._apply_funding_cost(portfolio, {**prices_all, **pump_prices}, now, next_time)
                 equity_now = portfolio.equity(prices_all)
                 self._equity_high = max(self._equity_high, equity_now)
                 drawdown = equity_now / self._equity_high - 1 if self._equity_high else 0
@@ -320,6 +321,27 @@ class ResearchBacktester:
             if self.config.backtest.cost_mode == "pessimistic"
             else self.config.backtest.slippage_bps
         )
+
+    def _apply_funding_cost(
+        self,
+        portfolio: Portfolio,
+        prices: dict[str, float],
+        start: datetime,
+        end: datetime,
+    ) -> float:
+        funding_bps = self.config.backtest.funding_bps_per_hour
+        if funding_bps <= 0 or not portfolio.positions:
+            return 0.0
+        hours = max((ensure_utc(end) - ensure_utc(start)).total_seconds() / 3600, 0.0)
+        if hours <= 0:
+            return 0.0
+        notional = sum(
+            position.quantity * prices.get(symbol, position.entry_price)
+            for symbol, position in portfolio.positions.items()
+        )
+        cost = notional * (funding_bps / 10_000) * hours
+        portfolio.cash -= cost
+        return cost
 
     def _create_run(self, session: Session | None, name: str) -> int | None:
         if session is None:

@@ -263,6 +263,7 @@ class BacktestConfig(BaseModel):
     slippage_bps: float = 5
     pessimistic_slippage_bps: float = 15
     cost_mode: str = "basic"
+    funding_bps_per_hour: float = 0.0
 
 
 class AppConfig(BaseModel):

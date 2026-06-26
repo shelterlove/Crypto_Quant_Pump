@@ -1,0 +1,10 @@
+extends: configs/candidate_combo_two_stage_probe25_weak50.yaml
+exchange_id: binance_usdm
+strategy_version: pump-v1-futures-1x
+
+backtest:
+  fee_bps: 5
+  slippage_bps: 8
+  pessimistic_slippage_bps: 20
+  cost_mode: basic
+  funding_bps_per_hour: 0.01

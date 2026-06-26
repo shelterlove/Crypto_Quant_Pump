@@ -14,7 +14,7 @@ from crypto_quant.data.interfaces import MarketDataProvider
 from crypto_quant.utils.time import TIMEFRAME_MS, ensure_utc, previous_closed_open_time
 
 
-class BinanceSpotDataProvider(MarketDataProvider):
+class BinanceBaseDataProvider(MarketDataProvider):
     REQUEST_RETRIES = 20
     RETRY_BACKOFF_SECONDS = 1.0
     RETRYABLE_HTTP_STATUSES = {418, 429, 451, 500, 502, 503, 504}
@@ -25,7 +25,7 @@ class BinanceSpotDataProvider(MarketDataProvider):
         requests.exceptions.Timeout,
     )
 
-    BASE_URLS = {
+    BASE_URLS: dict[str, str] = {
         "binance": "https://api.binance.com/api/v3",
         "binanceus": "https://api.binance.us/api/v3",
     }
@@ -54,35 +54,6 @@ class BinanceSpotDataProvider(MarketDataProvider):
         if https_proxy:
             proxies["https"] = https_proxy
         return proxies
-
-    def fetch_spot_symbols(self) -> list[dict[str, Any]]:
-        markets = self._get_json("/exchangeInfo").get("symbols", [])
-        rows: list[dict[str, Any]] = []
-        for market in markets:
-            base = market.get("baseAsset")
-            quote = market.get("quoteAsset")
-            symbol = f"{base}/{quote}"
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "base": base,
-                    "quote": quote,
-                    "active": market.get("status") == "TRADING",
-                    "spot": bool(market.get("isSpotTradingAllowed", False)),
-                    "info": market,
-                }
-            )
-        return rows
-
-    def fetch_usdt_spot_symbols(self) -> list[str]:
-        symbols: list[str] = []
-        for row in self.fetch_spot_symbols():
-            info = row.get("info") or {}
-            status = str(info.get("status") or ("TRADING" if row.get("active") else ""))
-            spot_allowed = bool(info.get("isSpotTradingAllowed", row.get("spot", False)))
-            if row.get("quote") == "USDT" and status == "TRADING" and spot_allowed:
-                symbols.append(str(row["symbol"]))
-        return sorted(symbols)
 
     def get_candles(
         self,
@@ -193,3 +164,78 @@ class BinanceSpotDataProvider(MarketDataProvider):
         for column in ["open", "high", "low", "close", "volume", "quote_volume"]:
             frame[column] = frame[column].astype(float)
         return frame
+
+
+class BinanceSpotDataProvider(BinanceBaseDataProvider):
+    BASE_URLS = {
+        "binance": "https://api.binance.com/api/v3",
+        "binanceus": "https://api.binance.us/api/v3",
+    }
+
+    def fetch_spot_symbols(self) -> list[dict[str, Any]]:
+        markets = self._get_json("/exchangeInfo").get("symbols", [])
+        rows: list[dict[str, Any]] = []
+        for market in markets:
+            base = market.get("baseAsset")
+            quote = market.get("quoteAsset")
+            symbol = f"{base}/{quote}"
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "base": base,
+                    "quote": quote,
+                    "active": market.get("status") == "TRADING",
+                    "spot": bool(market.get("isSpotTradingAllowed", False)),
+                    "info": market,
+                }
+            )
+        return rows
+
+    def fetch_usdt_spot_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        for row in self.fetch_spot_symbols():
+            info = row.get("info") or {}
+            status = str(info.get("status") or ("TRADING" if row.get("active") else ""))
+            spot_allowed = bool(info.get("isSpotTradingAllowed", row.get("spot", False)))
+            if row.get("quote") == "USDT" and status == "TRADING" and spot_allowed:
+                symbols.append(str(row["symbol"]))
+        return sorted(symbols)
+
+
+class BinanceUsdmDataProvider(BinanceBaseDataProvider):
+    BASE_URLS = {
+        "binance_usdm": "https://fapi.binance.com/fapi/v1",
+    }
+
+    def __init__(self, exchange_id: str = "binance_usdm") -> None:
+        if exchange_id not in self.BASE_URLS:
+            raise ValueError(f"unsupported Binance-compatible exchange_id: {exchange_id}")
+        self.base_url = self.BASE_URLS[exchange_id]
+        self.session = requests.Session()
+        self.session.proxies.update(self._proxy_options())
+        options: dict[str, Any] = {"enableRateLimit": True}
+        proxies = self._proxy_options()
+        if proxies:
+            options["proxies"] = proxies
+        exchange_class = getattr(ccxt, "binanceusdm", None)
+        self.exchange = exchange_class(options) if exchange_class is not None else None
+
+    def fetch_usdt_perp_symbols(self) -> list[str]:
+        markets = self._get_json("/exchangeInfo").get("symbols", [])
+        symbols: list[str] = []
+        for market in markets:
+            if (
+                market.get("quoteAsset") == "USDT"
+                and market.get("contractType") == "PERPETUAL"
+                and market.get("status") == "TRADING"
+            ):
+                symbols.append(f"{market.get('baseAsset')}/USDT")
+        return sorted(symbols)
+
+
+def binance_provider_for_exchange(exchange_id: str) -> BinanceBaseDataProvider:
+    if exchange_id == "binance_usdm":
+        return BinanceUsdmDataProvider(exchange_id)
+    if exchange_id in BinanceSpotDataProvider.BASE_URLS:
+        return BinanceSpotDataProvider(exchange_id)
+    raise ValueError(f"unsupported Binance-compatible exchange_id: {exchange_id}")
