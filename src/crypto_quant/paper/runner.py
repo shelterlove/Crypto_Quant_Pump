@@ -27,6 +27,11 @@ class PaperRunResult:
     orders: list[Order]
     equity: float
     state_path: Path
+    candidate_count: int = 0
+    open_positions: int = 0
+    market_phase: str | None = None
+    market_entry_mode: str | None = None
+    pump_regime: str | None = None
     skipped: bool = False
     reason: str | None = None
 
@@ -185,7 +190,19 @@ class PaperRunner:
                 }
             )
             self.backtester._finish_run(session, run_id, "completed")
-            return PaperRunResult(run_id, now, next_time, orders, equity, self.state_path)
+            return PaperRunResult(
+                run_id,
+                now,
+                next_time,
+                orders,
+                equity,
+                self.state_path,
+                candidate_count=len(pump_candidates),
+                open_positions=len(portfolio.positions),
+                market_phase=market.phase,
+                market_entry_mode=market.entry_mode,
+                pump_regime=self.backtester._pump_regime,
+            )
         except Exception:
             self.backtester._finish_run(session, run_id, "failed")
             raise

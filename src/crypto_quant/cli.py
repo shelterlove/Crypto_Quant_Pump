@@ -8,6 +8,7 @@ from alembic.config import Config
 from loguru import logger
 
 from alembic import command
+from crypto_quant.analysis.futures import write_futures_coverage_report
 from crypto_quant.backtest.runner import ResearchBacktester
 from crypto_quant.config.settings import load_config
 from crypto_quant.data.sync import CandleSyncService
@@ -22,10 +23,14 @@ db_app = typer.Typer(help="Database commands.")
 data_app = typer.Typer(help="Market data commands.")
 backtest_app = typer.Typer(help="Backtest commands.")
 paper_app = typer.Typer(help="Local paper trading commands.")
+analysis_app = typer.Typer(help="Research analysis commands.")
+futures_analysis_app = typer.Typer(help="Futures research diagnostics.")
 app.add_typer(db_app, name="db")
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
 app.add_typer(paper_app, name="paper")
+app.add_typer(analysis_app, name="analysis")
+analysis_app.add_typer(futures_analysis_app, name="futures")
 
 
 @db_app.command("upgrade")
@@ -118,6 +123,42 @@ def pressure_test(
             )
 
 
+@analysis_app.command("futures-coverage")
+def futures_coverage(
+    config: Path = Path("configs/futures_1x.yaml"),
+    start: str | None = "2023-01-01",
+    end: str | None = "2025-05-31",
+    report_dir: Path = Path("reports/futures_diagnostics"),
+) -> None:
+    _run_futures_coverage(config, start, end, report_dir)
+
+
+@futures_analysis_app.command("coverage")
+def futures_coverage_nested(
+    config: Path = Path("configs/futures_1x.yaml"),
+    start: str | None = "2023-01-01",
+    end: str | None = "2025-05-31",
+    report_dir: Path = Path("reports/futures_diagnostics"),
+) -> None:
+    _run_futures_coverage(config, start, end, report_dir)
+
+
+def _run_futures_coverage(
+    config: Path,
+    start: str | None,
+    end: str | None,
+    report_dir: Path,
+) -> None:
+    cfg = load_config(config)
+    default_start, default_end = default_one_year_window()
+    start_dt = parse_utc_datetime(start, default_start)
+    end_dt = parse_utc_datetime(end, default_end)
+    session_factory = get_session_factory(cfg.database_url)
+    with session_factory() as session:
+        paths = write_futures_coverage_report(session, cfg, start_dt, end_dt, report_dir)
+    typer.echo(f"futures coverage report={paths.html} summary={paths.summary_csv} candidates={paths.candidates_csv}")
+
+
 @paper_app.command("run")
 def run_paper(
     config: Path = Path("configs/main.yaml"),
@@ -188,7 +229,9 @@ def run_paper_cycle(
         return
     typer.echo(
         f"paper cycle {result.status}: run_id={result.run_id} orders={result.orders} "
-        f"equity={result.equity:.2f} synced_rows={result.synced_rows} sync_errors={result.sync_errors} "
+        f"buys={result.buys} sells={result.sells} candidates={result.candidates} open_positions={result.open_positions} "
+        f"equity={result.equity:.2f} pnl={result.pnl:.2f} return={result.return_pct:.2%} "
+        f"synced_rows={result.synced_rows} sync_errors={result.sync_errors} "
         f"latest={result.latest_candle_time} expected={result.expected_candle_time} lag_seconds={result.lag_seconds} "
         f"state={result.state_path} report={result.report_path} reason={result.reason}"
     )

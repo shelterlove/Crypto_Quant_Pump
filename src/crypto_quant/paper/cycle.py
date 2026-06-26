@@ -72,16 +72,27 @@ class PaperCycleResult:
     status: str
     run_id: int | None
     orders: int
+    buys: int
+    sells: int
+    candidates: int
+    open_positions: int
     equity: float
+    pnl: float
+    return_pct: float
     signal_time: datetime | None
     fill_time: datetime | None
     report_path: str | None
     state_path: str
+    working_dir: str
     synced_rows: int
     sync_errors: int
+    sync_error_symbols: list[str]
     latest_candle_time: datetime | None
     expected_candle_time: datetime
     lag_seconds: int | None
+    market_phase: str | None = None
+    market_entry_mode: str | None = None
+    pump_regime: str | None = None
     reason: str | None = None
 
     def to_json(self) -> str:
@@ -91,6 +102,27 @@ class PaperCycleResult:
             return str(value)
 
         return json.dumps(asdict(self), default=default, sort_keys=True)
+
+    def to_text(self) -> str:
+        report = self.report_path or "-"
+        reason = self.reason or "-"
+        lag = "-" if self.lag_seconds is None else f"{self.lag_seconds}s"
+        return "\n".join(
+            [
+                f"status={self.status} run_id={self.run_id} reason={reason}",
+                f"equity={self.equity:.2f} pnl={self.pnl:.2f} return={self.return_pct:.2%}",
+                f"orders={self.orders} buys={self.buys} sells={self.sells} "
+                f"candidates={self.candidates} open_positions={self.open_positions}",
+                f"market_phase={self.market_phase or '-'} entry_mode={self.market_entry_mode or '-'} pump_regime={self.pump_regime or '-'}",
+                f"signal_time={self.signal_time} fill_time={self.fill_time}",
+                f"latest_candle={self.latest_candle_time} expected_candle={self.expected_candle_time} lag={lag}",
+                f"synced_rows={self.synced_rows} sync_errors={self.sync_errors}",
+                f"sync_error_symbols={','.join(self.sync_error_symbols) or '-'}",
+                f"report={report}",
+                f"state={self.state_path}",
+                f"working_dir={self.working_dir}",
+            ]
+        )
 
 
 class PaperCycleRunner:
@@ -140,9 +172,11 @@ class PaperCycleRunner:
             session.commit()
             report_path = None
             if paper.strategy_run_id is not None:
-                report_path = str(BacktestReportWriter(self.report_dir).write(session, paper.strategy_run_id).html)
+                report_path = str(BacktestReportWriter(self.report_dir).write(session, paper.strategy_run_id).html.resolve())
                 session.commit()
-            return self._result(sync_result, freshness, paper, report_path)
+            result = self._result(sync_result, freshness, paper, report_path)
+            self._write_latest_status(result)
+            return result
 
     def _sync_latest(self, session: Session, now: datetime) -> CandleSyncResult:
         end = self._expected_candle_time(now)
@@ -159,10 +193,13 @@ class PaperCycleRunner:
         return service.run(session, plan)
 
     def _sync_symbols(self, session: Session) -> list[str]:
+        service = CandleSyncService(exchange=self.config.exchange_id)
         if self.all_usdt_spot:
-            symbols = CandleSyncService(exchange=self.config.exchange_id).resolve_symbols(None, all_usdt_spot=True)
+            symbols = service.resolve_symbols(None, all_usdt_spot=True)
         else:
-            symbols = distinct_candle_symbols(session, self.config.exchange_id, "1h")
+            local_symbols = set(distinct_candle_symbols(session, self.config.exchange_id, "1h"))
+            active_symbols = set(service.resolve_symbols(None, all_usdt_spot=True))
+            symbols = sorted(local_symbols & active_symbols)
         return sorted(set(symbols) | {self.config.market_state.btc_symbol})
 
     def _freshness(self, session: Session, now: datetime) -> FreshnessStatus:
@@ -195,19 +232,41 @@ class PaperCycleRunner:
         report_path: str | None,
     ) -> PaperCycleResult:
         status = "skipped" if paper.skipped else "completed"
+        buys = sum(1 for order in paper.orders if order.side == "buy")
+        sells = sum(1 for order in paper.orders if order.side == "sell")
+        initial_equity = self.config.backtest.initial_equity
+        pnl = paper.equity - initial_equity
+        return_pct = pnl / initial_equity if initial_equity else 0.0
         return PaperCycleResult(
             status=status,
             run_id=paper.strategy_run_id,
             orders=len(paper.orders),
+            buys=buys,
+            sells=sells,
+            candidates=paper.candidate_count,
+            open_positions=paper.open_positions,
             equity=paper.equity,
+            pnl=pnl,
+            return_pct=return_pct,
             signal_time=paper.processed_signal_time,
             fill_time=paper.fill_time,
             report_path=report_path,
-            state_path=str(paper.state_path),
+            state_path=str(paper.state_path.resolve()),
+            working_dir=str(Path.cwd()),
             synced_rows=sync_result.inserted_or_updated,
             sync_errors=len(sync_result.errors),
+            sync_error_symbols=sorted(sync_result.errors),
             latest_candle_time=freshness.latest_candle_time,
             expected_candle_time=freshness.expected_candle_time,
             lag_seconds=freshness.lag_seconds,
+            market_phase=paper.market_phase,
+            market_entry_mode=paper.market_entry_mode,
+            pump_regime=paper.pump_regime,
             reason=paper.reason,
         )
+
+    def _write_latest_status(self, result: PaperCycleResult) -> None:
+        status_dir = self.state_path.parent
+        status_dir.mkdir(parents=True, exist_ok=True)
+        (status_dir / "latest_status.json").write_text(result.to_json() + "\n", encoding="utf-8")
+        (status_dir / "latest_status.txt").write_text(result.to_text() + "\n", encoding="utf-8")
