@@ -19,3 +19,11 @@ def test_v1_pg_matches_final_risk_baseline() -> None:
     cfg = load_config("configs/v1_pg.yaml")
     assert cfg.pump_mode.equity_peak_risk_enabled is True
     assert cfg.pump_mode.equity_peak_risk_floor == 0.70
+
+
+def test_futures_1x_config_selects_usdm_and_funding_drag() -> None:
+    cfg = load_config("configs/futures_1x.yaml")
+    assert cfg.exchange_id == "binance_usdm"
+    assert cfg.strategy_version == "pump-v1-futures-1x"
+    assert cfg.backtest.fee_bps == 5
+    assert cfg.backtest.funding_bps_per_hour > 0

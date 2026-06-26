@@ -8,7 +8,6 @@ from alembic.config import Config
 from loguru import logger
 
 from alembic import command
-from crypto_quant.analysis.futures import write_futures_coverage_report
 from crypto_quant.backtest.runner import ResearchBacktester
 from crypto_quant.config.settings import load_config
 from crypto_quant.data.sync import CandleSyncService
@@ -149,6 +148,8 @@ def _run_futures_coverage(
     end: str | None,
     report_dir: Path,
 ) -> None:
+    from crypto_quant.analysis.futures import write_futures_coverage_report
+
     cfg = load_config(config)
     default_start, default_end = default_one_year_window()
     start_dt = parse_utc_datetime(start, default_start)

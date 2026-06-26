@@ -6,7 +6,7 @@ from datetime import datetime
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from crypto_quant.data.binance import BinanceSpotDataProvider
+from crypto_quant.data.binance import BinanceBaseDataProvider, binance_provider_for_exchange
 from crypto_quant.data.quality import validate_candles
 from crypto_quant.storage.candles import CandleCoverage, coverage, has_complete_candle_coverage, upsert_candles
 
@@ -28,15 +28,17 @@ class CandleSyncResult:
 
 
 class CandleSyncService:
-    def __init__(self, provider: BinanceSpotDataProvider | None = None, exchange: str = "binance") -> None:
-        self.provider = provider or BinanceSpotDataProvider(exchange)
+    def __init__(self, provider: BinanceBaseDataProvider | None = None, exchange: str = "binance") -> None:
+        self.provider = provider or binance_provider_for_exchange(exchange)
         self.exchange = exchange
 
     def resolve_symbols(self, explicit_symbols: list[str] | None, all_usdt_spot: bool) -> list[str]:
         if explicit_symbols:
             return sorted(set(explicit_symbols))
         if all_usdt_spot:
-            return self.provider.fetch_usdt_spot_symbols()
+            if self.exchange == "binance_usdm":
+                return sorted(self.provider.fetch_usdt_perp_symbols())
+            return sorted(self.provider.fetch_usdt_spot_symbols())
         return ["BTC/USDT"]
 
     def build_plan(

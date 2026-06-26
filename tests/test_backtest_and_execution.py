@@ -71,6 +71,34 @@ def test_pump_regime_snapshot_detects_hot_market() -> None:
     assert backtester._detect_pump_regime_snapshot(snapshot) == "HOT"
 
 
+def test_funding_cost_reduces_cash_for_open_futures_exposure() -> None:
+    cfg = load_config("configs/futures_1x.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
+    backtester = ResearchBacktester(cfg)
+    portfolio = Portfolio(
+        cash=100_000,
+        positions={
+            "AAA/USDT": OpenPosition(
+                "AAA/USDT",
+                quantity=10,
+                entry_price=100,
+                stop_price=90,
+                atr=5,
+                opened_at=datetime(2024, 1, 1, tzinfo=UTC),
+            )
+        },
+    )
+
+    cost = backtester._apply_funding_cost(
+        portfolio,
+        {"AAA/USDT": 120},
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 1, 2, tzinfo=UTC),
+    )
+
+    assert cost > 0
+    assert portfolio.cash == pytest.approx(100_000 - cost)
+
+
 def test_pump_candidates_from_snapshot_detect_fast_volume_backed_move() -> None:
     cfg = load_config("configs/v1.yaml").model_copy(update={"pump_mode": PumpModeConfig(enabled=True)})
     backtester = ResearchBacktester(cfg)
