@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Annotated
 
@@ -12,8 +14,9 @@ from crypto_quant.backtest.runner import ResearchBacktester
 from crypto_quant.config.settings import load_config
 from crypto_quant.data.sync import CandleSyncService
 from crypto_quant.paper.cycle import PaperCycleDataStale, PaperCycleLocked, PaperCycleRunner
+from crypto_quant.paper.monitor import PaperMonitorWriter
 from crypto_quant.paper.runner import PaperRunner
-from crypto_quant.reporting import BacktestReportWriter
+from crypto_quant.reporting import BacktestReportWriter, RunSummaryBuilder
 from crypto_quant.storage.database import get_session_factory
 from crypto_quant.utils.time import default_one_year_window, parse_utc_datetime
 
@@ -22,14 +25,10 @@ db_app = typer.Typer(help="Database commands.")
 data_app = typer.Typer(help="Market data commands.")
 backtest_app = typer.Typer(help="Backtest commands.")
 paper_app = typer.Typer(help="Local paper trading commands.")
-analysis_app = typer.Typer(help="Research analysis commands.")
-futures_analysis_app = typer.Typer(help="Futures research diagnostics.")
 app.add_typer(db_app, name="db")
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
 app.add_typer(paper_app, name="paper")
-app.add_typer(analysis_app, name="analysis")
-analysis_app.add_typer(futures_analysis_app, name="futures")
 
 
 @db_app.command("upgrade")
@@ -72,7 +71,6 @@ def sync_candles(
             f"start={item.start} end={item.end} missing={item.missing_intervals}"
         )
 
-
 @backtest_app.command("run")
 def run_backtest(
     config: Path = Path("configs/v1.yaml"),
@@ -93,7 +91,7 @@ def run_backtest(
     logger.info("backtest completed run_id={} orders={} final_equity={}", result.strategy_run_id, len(result.orders), result.final_equity)
     typer.echo(
         f"completed: run_id={result.strategy_run_id} orders={len(result.orders)} "
-        f"final_equity={result.final_equity:.2f} report={paths.html}"
+        f"final_equity={result.final_equity:.2f} report={paths.html.resolve()}"
     )
 
 
@@ -118,47 +116,8 @@ def pressure_test(
             paths = BacktestReportWriter(report_dir).write(session, result.strategy_run_id or 0)
             typer.echo(
                 f"slippage={bps / 100:.2f}% run_id={result.strategy_run_id} "
-                f"final_equity={result.final_equity:.2f} report={paths.html}"
+                f"final_equity={result.final_equity:.2f} report={paths.html.resolve()}"
             )
-
-
-@analysis_app.command("futures-coverage")
-def futures_coverage(
-    config: Path = Path("configs/futures_1x.yaml"),
-    start: str | None = "2023-01-01",
-    end: str | None = "2025-05-31",
-    report_dir: Path = Path("reports/futures_diagnostics"),
-) -> None:
-    _run_futures_coverage(config, start, end, report_dir)
-
-
-@futures_analysis_app.command("coverage")
-def futures_coverage_nested(
-    config: Path = Path("configs/futures_1x.yaml"),
-    start: str | None = "2023-01-01",
-    end: str | None = "2025-05-31",
-    report_dir: Path = Path("reports/futures_diagnostics"),
-) -> None:
-    _run_futures_coverage(config, start, end, report_dir)
-
-
-def _run_futures_coverage(
-    config: Path,
-    start: str | None,
-    end: str | None,
-    report_dir: Path,
-) -> None:
-    from crypto_quant.analysis.futures import write_futures_coverage_report
-
-    cfg = load_config(config)
-    default_start, default_end = default_one_year_window()
-    start_dt = parse_utc_datetime(start, default_start)
-    end_dt = parse_utc_datetime(end, default_end)
-    session_factory = get_session_factory(cfg.database_url)
-    with session_factory() as session:
-        paths = write_futures_coverage_report(session, cfg, start_dt, end_dt, report_dir)
-    typer.echo(f"futures coverage report={paths.html} summary={paths.summary_csv} candidates={paths.candidates_csv}")
-
 
 @paper_app.command("run")
 def run_paper(
@@ -173,8 +132,8 @@ def run_paper(
         result = PaperRunner(cfg, state_path=state_path, lookback_days=lookback_days).run_once(session)
         session.commit()
         report_path = None
-        if result.strategy_run_id is not None:
-            report_path = BacktestReportWriter(report_dir).write(session, result.strategy_run_id).html
+        if result.strategy_run_id is not None and result.orders:
+            report_path = BacktestReportWriter(report_dir).write(session, result.strategy_run_id).html.resolve()
             session.commit()
     if result.skipped:
         typer.echo(f"paper skipped: {result.reason} state={result.state_path}")
@@ -184,6 +143,26 @@ def run_paper(
         f"signal_time={result.processed_signal_time} fill_time={result.fill_time} "
         f"equity={result.equity:.2f} state={result.state_path} report={report_path}"
     )
+
+
+@paper_app.command("report")
+def write_paper_report(
+    config: Path = Path("configs/main.yaml"),
+    run_id: int | None = None,
+    report_dir: Path = Path("reports"),
+) -> None:
+    cfg = load_config(config)
+    session_factory = get_session_factory(cfg.database_url)
+    with session_factory() as session:
+        target_run_id = run_id
+        if target_run_id is None:
+            latest = RunSummaryBuilder(report_dir).latest_completed_run(session, "paper")
+            if latest is None:
+                raise typer.BadParameter("no completed paper run found")
+            target_run_id = latest.run_id
+        path = BacktestReportWriter(report_dir).write(session, target_run_id).html.resolve()
+        session.commit()
+    typer.echo(f"paper report generated: run_id={target_run_id} report={path}")
 
 
 @paper_app.command("cycle")
@@ -236,3 +215,22 @@ def run_paper_cycle(
         f"latest={result.latest_candle_time} expected={result.expected_candle_time} lag_seconds={result.lag_seconds} "
         f"state={result.state_path} report={result.report_path} reason={result.reason}"
     )
+
+
+@paper_app.command("serve-monitor")
+def serve_monitor(
+    state_dir: Path = Path("paper_state"),
+    report_dir: Path = Path("reports"),
+    config: Path = Path("configs/main.yaml"),
+    host: str = "0.0.0.0",
+    port: int = 8000,
+) -> None:
+    cfg = load_config(config)
+    session_factory = get_session_factory(cfg.database_url)
+    with session_factory() as session:
+        latest = PaperMonitorWriter(state_dir, report_dir).load_latest_status()
+        PaperMonitorWriter(state_dir, report_dir).write(session, latest)
+    root = state_dir.resolve().parent
+    handler = partial(SimpleHTTPRequestHandler, directory=str(root))
+    typer.echo(f"paper monitor serving http://{host}:{port}/paper_state/dashboard.html from {root}")
+    ThreadingHTTPServer((host, port), handler).serve_forever()

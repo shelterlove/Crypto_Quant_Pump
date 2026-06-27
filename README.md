@@ -10,6 +10,8 @@ The active strategy is `pump-v1-main` in `configs/main.yaml`. It:
 - enters small probe positions and uses two-stage confirmation scaling
 - manages pump exits and writes reproducible runs, orders, positions, and equity curves
 
+Ad hoc research outputs are kept under `artifacts/research/` so the repository root stays focused on source, configs, and docs.
+
 ## Quick Start
 
 ```bash
@@ -39,7 +41,12 @@ uv run crypto-quant backtest run --config configs/main.yaml --start 2025-06-01 -
 
 # VPS/local paper cycle: sync recent candles, check freshness, run one paper step
 uv run crypto-quant paper cycle --config configs/main.yaml --json-output
+
+# Generate a detailed report for the latest completed paper run on demand
+uv run crypto-quant paper report --config configs/main.yaml
 ```
+
+`paper cycle` keeps runtime monitoring lightweight. It writes `paper_state/latest_status.json`, `paper_state/latest_status.txt`, and `paper_state/dashboard.html` every cycle. Detailed paper reports under `reports/<run_id>/` are generated only when a cycle actually places orders, or when you run `paper report`.
 
 ## Deployment
 

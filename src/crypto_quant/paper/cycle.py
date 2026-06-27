@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 
 from crypto_quant.config.settings import AppConfig
 from crypto_quant.data.sync import CandleSyncResult, CandleSyncService
+from crypto_quant.paper.monitor import PaperMonitorWriter
 from crypto_quant.paper.runner import PaperRunner, PaperRunResult
-from crypto_quant.reporting import BacktestReportWriter
+from crypto_quant.reporting import BacktestReportWriter, RunSummaryBuilder
 from crypto_quant.storage.candles import distinct_candle_symbols
 from crypto_quant.storage.models import Candle
 from crypto_quant.utils.time import ensure_utc, previous_closed_open_time, timeframe_delta
@@ -82,6 +83,7 @@ class PaperCycleResult:
     signal_time: datetime | None
     fill_time: datetime | None
     report_path: str | None
+    report_exists: bool
     state_path: str
     working_dir: str
     synced_rows: int
@@ -90,6 +92,11 @@ class PaperCycleResult:
     latest_candle_time: datetime | None
     expected_candle_time: datetime
     lag_seconds: int | None
+    latest_db_run_id: int | None = None
+    latest_db_run_status: str | None = None
+    last_completed_run_id: int | None = None
+    last_completed_report_path: str | None = None
+    last_completed_report_exists: bool = False
     market_phase: str | None = None
     market_entry_mode: str | None = None
     pump_regime: str | None = None
@@ -118,7 +125,11 @@ class PaperCycleResult:
                 f"latest_candle={self.latest_candle_time} expected_candle={self.expected_candle_time} lag={lag}",
                 f"synced_rows={self.synced_rows} sync_errors={self.sync_errors}",
                 f"sync_error_symbols={','.join(self.sync_error_symbols) or '-'}",
-                f"report={report}",
+                f"report={report} report_exists={self.report_exists}",
+                f"latest_db_run_id={self.latest_db_run_id} latest_db_run_status={self.latest_db_run_status or '-'}",
+                f"last_completed_run_id={self.last_completed_run_id} "
+                f"last_completed_report={self.last_completed_report_path or '-'} "
+                f"last_completed_report_exists={self.last_completed_report_exists}",
                 f"state={self.state_path}",
                 f"working_dir={self.working_dir}",
             ]
@@ -151,6 +162,7 @@ class PaperCycleRunner:
         self.all_usdt_spot = all_usdt_spot
         self.skip_sync = skip_sync
         self.allow_stale = allow_stale
+        self.summary_builder = RunSummaryBuilder(report_dir)
 
     def run(self, session: Session, now: datetime | None = None) -> PaperCycleResult:
         with FileLock(self.lock_path):
@@ -171,11 +183,16 @@ class PaperCycleRunner:
             paper = PaperRunner(self.config, state_path=self.state_path, lookback_days=self.lookback_days).run_once(session)
             session.commit()
             report_path = None
-            if paper.strategy_run_id is not None:
-                report_path = str(BacktestReportWriter(self.report_dir).write(session, paper.strategy_run_id).html.resolve())
+            report_exists = False
+            if paper.strategy_run_id is not None and paper.orders:
+                report_file = BacktestReportWriter(self.report_dir).write(session, paper.strategy_run_id).html.resolve()
+                report_path = str(report_file)
+                report_exists = report_file.exists()
+                if not report_exists:
+                    raise RuntimeError(f"report file missing after write: {report_file}")
                 session.commit()
-            result = self._result(sync_result, freshness, paper, report_path)
-            self._write_latest_status(result)
+            result = self._result(session, sync_result, freshness, paper, report_path, report_exists)
+            self._write_monitor_files(session, result)
             return result
 
     def _sync_latest(self, session: Session, now: datetime) -> CandleSyncResult:
@@ -226,10 +243,12 @@ class PaperCycleRunner:
 
     def _result(
         self,
+        session: Session,
         sync_result: CandleSyncResult,
         freshness: FreshnessStatus,
         paper: PaperRunResult,
         report_path: str | None,
+        report_exists: bool,
     ) -> PaperCycleResult:
         status = "skipped" if paper.skipped else "completed"
         buys = sum(1 for order in paper.orders if order.side == "buy")
@@ -237,6 +256,8 @@ class PaperCycleRunner:
         initial_equity = self.config.backtest.initial_equity
         pnl = paper.equity - initial_equity
         return_pct = pnl / initial_equity if initial_equity else 0.0
+        latest_db_run = self.summary_builder.latest_run(session, "paper")
+        last_completed_run = self.summary_builder.latest_completed_run(session, "paper")
         return PaperCycleResult(
             status=status,
             run_id=paper.strategy_run_id,
@@ -251,6 +272,7 @@ class PaperCycleRunner:
             signal_time=paper.processed_signal_time,
             fill_time=paper.fill_time,
             report_path=report_path,
+            report_exists=report_exists,
             state_path=str(paper.state_path.resolve()),
             working_dir=str(Path.cwd()),
             synced_rows=sync_result.inserted_or_updated,
@@ -259,14 +281,20 @@ class PaperCycleRunner:
             latest_candle_time=freshness.latest_candle_time,
             expected_candle_time=freshness.expected_candle_time,
             lag_seconds=freshness.lag_seconds,
+            latest_db_run_id=latest_db_run.run_id if latest_db_run is not None else None,
+            latest_db_run_status=latest_db_run.status if latest_db_run is not None else None,
+            last_completed_run_id=last_completed_run.run_id if last_completed_run is not None else None,
+            last_completed_report_path=last_completed_run.report_path if last_completed_run is not None else None,
+            last_completed_report_exists=last_completed_run.report_exists if last_completed_run is not None else False,
             market_phase=paper.market_phase,
             market_entry_mode=paper.market_entry_mode,
             pump_regime=paper.pump_regime,
             reason=paper.reason,
         )
 
-    def _write_latest_status(self, result: PaperCycleResult) -> None:
+    def _write_monitor_files(self, session: Session, result: PaperCycleResult) -> None:
         status_dir = self.state_path.parent
         status_dir.mkdir(parents=True, exist_ok=True)
         (status_dir / "latest_status.json").write_text(result.to_json() + "\n", encoding="utf-8")
         (status_dir / "latest_status.txt").write_text(result.to_text() + "\n", encoding="utf-8")
+        PaperMonitorWriter(status_dir, self.report_dir).write(session, asdict(result))

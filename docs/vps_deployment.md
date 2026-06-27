@@ -101,7 +101,8 @@ Exact values may shift if the data vendor revises historical candles or the symb
 - syncs recent `1h` candles for symbols already present in the database
 - checks BTC candle freshness before strategy execution
 - runs one paper step using `configs/main.yaml`
-- writes `paper_state/main.json` and a report when a new strategy run is created
+- writes `paper_state/main.json`, `paper_state/latest_status.json`, `paper_state/latest_status.txt`, and `paper_state/dashboard.html`
+- generates a detailed report under `reports/<run_id>/` only when the cycle places orders, or when you run `crypto-quant paper report`
 - prints a concise summary, or JSON when `--json-output` is set
 
 Run it manually first:
@@ -221,7 +222,8 @@ Before connecting any real exchange execution:
 
 - Confirm `configs/main.yaml` is the only production config used by services.
 - Confirm `crypto-quant-paper.timer` runs successfully for at least several days.
-- Confirm reports are generated under `reports/<run_id>/`.
+- Confirm `paper_state/dashboard.html` and `paper_state/latest_status.json` refresh every cycle.
+- Confirm reports are generated under `reports/<run_id>/` after a cycle with actual orders, or via `crypto-quant paper report`.
 - Confirm latest candles are no more than 1-2 hours stale.
 - Confirm lock conflicts show exit code `75` rather than creating duplicate runs.
 - Confirm the strategy records `pump_entry`, `pump_probe_confirm`, and exit mechanisms as expected.
