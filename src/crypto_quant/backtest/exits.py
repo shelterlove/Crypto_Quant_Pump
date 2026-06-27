@@ -132,6 +132,12 @@ class StrategyExitExecutor:
         frame = candles_1h.get(symbol, pd.DataFrame())
         current = self.slice_frame(frame, trigger_time) if not frame.empty else pd.DataFrame()
         exit_price = self.next_open(candles_1h, symbol, exit_time)
+        if (
+            self.config.pump_mode.strict_loss_stop_enabled
+            and reason in {"pump_initial_stop", "pump_probe_kill"}
+            and position.stop_price > 0
+        ):
+            exit_price = position.stop_price
         if exit_price is None:
             exit_price = float(current["close"].iloc[-1]) if not current.empty else position.entry_price
         if exit_price <= 0:

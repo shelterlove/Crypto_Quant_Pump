@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from crypto_quant.backtest.runner import OpenPosition, Portfolio, ResearchBacktester
 from crypto_quant.config.settings import AppConfig
+from crypto_quant.data.binance import BinanceBaseDataProvider, binance_provider_for_exchange
 from crypto_quant.execution.broker import BacktestBroker, Order
 from crypto_quant.risk.market_state import MarketState, fast_risk_valve_triggered
 from crypto_quant.storage.candles import distinct_candle_symbols, load_candles
@@ -43,25 +44,33 @@ class PaperRunner:
     This intentionally avoids exchange APIs while exercising the same portfolio state machine as backtests.
     """
 
-    def __init__(self, config: AppConfig, state_path: Path = Path("paper_state/main.json"), lookback_days: int = 120) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        state_path: Path = Path("paper_state/main.json"),
+        lookback_days: int = 120,
+        provider: BinanceBaseDataProvider | None = None,
+    ) -> None:
         self.config = config
         self.state_path = state_path
         self.lookback_days = lookback_days
         self.backtester = ResearchBacktester(config)
+        self.provider = provider or binance_provider_for_exchange(config.exchange_id)
 
     def run_once(self, session: Session) -> PaperRunResult:
         latest = self._latest_open_time(session)
         if latest is None:
             return self._skipped("no local 1h candles")
 
-        end = ensure_utc(latest)
+        signal_time = ensure_utc(latest)
+        fill_time = signal_time + timedelta(hours=1)
         state = self._load_state()
         last_fill_time = self._parse_dt(state.get("last_fill_time"))
-        if last_fill_time is not None and end <= last_fill_time:
+        if last_fill_time is not None and fill_time <= last_fill_time:
             return PaperRunResult(
                 strategy_run_id=None,
                 processed_signal_time=self._parse_dt(state.get("last_signal_time")),
-                fill_time=end,
+                fill_time=fill_time,
                 orders=[],
                 equity=float(state.get("last_equity", self.config.backtest.initial_equity)),
                 state_path=self.state_path,
@@ -69,20 +78,20 @@ class PaperRunner:
                 reason="already processed latest fill candle",
             )
 
-        start = end - timedelta(days=self.lookback_days)
+        start = signal_time - timedelta(days=self.lookback_days)
         all_symbols = sorted(
             set(distinct_candle_symbols(session, self.config.exchange_id, "1h"))
             | {self.config.market_state.btc_symbol}
         )
         candles = self.backtester._prepare_candles(
-            load_candles(session, self.config.exchange_id, all_symbols, "1h", start, end)
+            load_candles(session, self.config.exchange_id, all_symbols, "1h", start, signal_time)
         )
-        timeline = self.backtester._timeline(candles, start, end)
-        if len(timeline) < 2:
+        timeline = self.backtester._timeline(candles, start, signal_time)
+        if len(timeline) < 1:
             return self._skipped("not enough local 1h candles")
 
-        now = timeline[-2]
-        next_time = timeline[-1]
+        now = timeline[-1]
+        next_time = fill_time
 
         if self.config.market_state.btc_symbol not in candles or candles[self.config.market_state.btc_symbol].empty:
             return self._skipped("missing BTC/USDT candles")
@@ -90,7 +99,7 @@ class PaperRunner:
         self.backtester._pos_cache_1h = self.backtester._build_position_cache(candles, timeline)
         self.backtester._precompute_indicators(candles)
         self.backtester._snapshot_cache_1h = self.backtester._build_snapshot_value_cache(candles)
-        self._warm_market_context(candles, timeline[:-1])
+        self._warm_market_context(candles, timeline)
 
         portfolio = self._portfolio_from_state(state)
         self.backtester._equity_high = float(state.get("equity_high", self.config.backtest.initial_equity))
@@ -129,6 +138,13 @@ class PaperRunner:
                 )
 
             broker = BacktestBroker(self.config.backtest.fee_bps, self.backtester._slippage_bps())
+            held_symbols = list(portfolio.positions)
+            fill_open_prices = self._fetch_fill_open_prices(held_symbols, next_time)
+            missing_held = sorted(set(held_symbols) - set(fill_open_prices))
+            if missing_held:
+                raise RuntimeError(f"missing current hour open prices for held symbols: {', '.join(missing_held)}")
+            self.backtester._paper_fill_time = next_time
+            self.backtester._paper_fill_open_prices = fill_open_prices
             self.backtester._process_stops(session, run_id, now, next_time, portfolio, candles, broker, orders, market)
 
             pump_snapshot = self.backtester._pump_snapshot(candles, pump_symbols, now)
@@ -143,6 +159,8 @@ class PaperRunner:
                 pump_prices = pump_prices_all
                 pump_equity = portfolio.equity({**prices_all, **pump_prices})
                 pump_candidates = self.backtester._pump_candidates_from_snapshot(pump_snapshot, portfolio, pump_equity, now)
+                candidate_opens = self._fetch_fill_open_prices([candidate.symbol for candidate in pump_candidates], next_time)
+                self.backtester._paper_fill_open_prices.update(candidate_opens)
 
             self.backtester._enter_pump_positions(
                 session,
@@ -158,9 +176,8 @@ class PaperRunner:
                 market,
             )
 
-            final_prices = self.backtester._last_prices(
-                self.backtester._slice(candles, all_symbols, next_time, cache=self.backtester._pos_cache_1h)
-            )
+            final_prices = dict(prices_all)
+            final_prices.update(self.backtester._paper_fill_open_prices)
             equity = portfolio.equity(final_prices)
             self.backtester._equity_high = max(self.backtester._equity_high, equity)
             drawdown = equity / self.backtester._equity_high - 1 if self.backtester._equity_high > 0 else 0.0
@@ -206,6 +223,9 @@ class PaperRunner:
         except Exception:
             self.backtester._finish_run(session, run_id, "failed")
             raise
+        finally:
+            self.backtester._paper_fill_time = None
+            self.backtester._paper_fill_open_prices = {}
 
     def _warm_market_context(self, candles: dict[str, pd.DataFrame], timeline: list[datetime]) -> None:
         btc = candles.get(self.config.market_state.btc_symbol, pd.DataFrame())
@@ -243,6 +263,15 @@ class PaperRunner:
             .where(Candle.timeframe == "1h")
             .where(Candle.symbol == self.config.market_state.btc_symbol)
         ).scalar_one_or_none()
+
+    def _fetch_fill_open_prices(self, symbols: list[str], fill_time: datetime) -> dict[str, float]:
+        requested = sorted(set(symbols))
+        if not requested:
+            return {}
+        try:
+            return self.provider.fetch_open_prices_at(requested, "1h", fill_time)
+        except Exception:
+            return {}
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():

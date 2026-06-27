@@ -111,6 +111,46 @@ class BinanceBaseDataProvider(MarketDataProvider):
     def _fetch_klines(self, symbol: str, timeframe: str, since: int | None, end_ms: int | None, limit: int = 1000) -> pd.DataFrame:
         return self._klines_to_frame(self._fetch_klines_raw(symbol, timeframe, since, end_ms, limit))
 
+    def fetch_last_prices(self, symbols: list[str]) -> dict[str, float]:
+        requested = {symbol.replace("/", ""): symbol for symbol in symbols}
+        if not requested:
+            return {}
+        payload = self._get_json("/ticker/price")
+        if not isinstance(payload, list):
+            return {}
+        prices: dict[str, float] = {}
+        for row in payload:
+            market_symbol = str(row.get("symbol", ""))
+            mapped = requested.get(market_symbol)
+            if mapped is None:
+                continue
+            try:
+                prices[mapped] = float(row["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return prices
+
+    def fetch_open_prices_at(self, symbols: list[str], timeframe: str, open_time: datetime) -> dict[str, float]:
+        requested = sorted(set(symbols))
+        if not requested:
+            return {}
+        open_time = ensure_utc(open_time)
+        open_ms = int(open_time.timestamp() * 1000)
+        end_ms = open_ms + TIMEFRAME_MS[timeframe] - 1
+        prices: dict[str, float] = {}
+        for symbol in requested:
+            batch = self._fetch_klines_raw(symbol, timeframe, open_ms, end_ms, limit=2)
+            if not batch:
+                continue
+            candle = next((row for row in batch if int(row[0]) == open_ms), None)
+            if candle is None:
+                continue
+            try:
+                prices[symbol] = float(candle[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+        return prices
+
     def _fetch_klines_raw(
         self,
         symbol: str,

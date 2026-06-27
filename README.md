@@ -44,9 +44,14 @@ uv run crypto-quant paper cycle --config configs/main.yaml --json-output
 
 # Generate a detailed report for the latest completed paper run on demand
 uv run crypto-quant paper report --config configs/main.yaml
+
+# Start the VPS paper stack in tmux: cycle + live refresh + monitor
+./scripts/start_paper_stack.sh
 ```
 
 `paper cycle` keeps runtime monitoring lightweight. It writes `paper_state/latest_status.json`, `paper_state/latest_status.txt`, and `paper_state/dashboard.html` every cycle. Detailed paper reports under `reports/<run_id>/` are generated only when a cycle actually places orders, or when you run `paper report`.
+
+`paper refresh-live` writes `paper_state/live_status.json` with current prices, realtime equity, and current positions without storing minute bars.
 
 ## Deployment
 

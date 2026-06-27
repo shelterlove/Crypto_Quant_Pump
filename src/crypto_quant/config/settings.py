@@ -242,6 +242,7 @@ class PumpModeConfig(BaseModel):
     market_context_fading_ema20_dev_pct: float = 18.0
     market_context_fading_volume_ratio: float = 13.0
     market_context_fading_ret_6h: float = 0.23
+    strict_loss_stop_enabled: bool = False
 
 
 class RiskConfig(BaseModel):

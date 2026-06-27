@@ -33,6 +33,12 @@ class PaperMonitorWriter:
             return {}
         return json.loads(latest.read_text(encoding="utf-8"))
 
+    def load_live_status(self) -> dict[str, Any]:
+        live = self.state_dir / "live_status.json"
+        if not live.exists():
+            return {}
+        return json.loads(live.read_text(encoding="utf-8"))
+
     def _recent_runs(self, session: Session, limit: int) -> list[RunSummary]:
         return self.summary_builder.latest_runs(session, "paper", limit)
 
@@ -53,10 +59,16 @@ class PaperMonitorWriter:
         trades: list[ClosedTradeSummary],
     ) -> str:
         generated_at = ensure_utc(datetime.now(UTC)).isoformat()
+        live = self.load_live_status()
         latest_run = runs[0] if runs else None
         last_completed = next((run for run in runs if run.status == "completed"), None)
-        rows = "\n".join(self._table_row(run) for run in runs) or "<tr><td colspan='7'>暂无运行记录。</td></tr>"
-        position_rows = "\n".join(self._position_row(item) for item in positions) or "<tr><td colspan='8'>当前没有持仓。</td></tr>"
+        rows = "\n".join(self._table_row(run) for run in runs[:8]) or "<tr><td colspan='7'>暂无运行记录。</td></tr>"
+        live_positions = live.get("positions") if isinstance(live.get("positions"), list) else []
+        position_rows = (
+            "\n".join(self._live_position_row(item) for item in live_positions)
+            if live_positions
+            else "\n".join(self._position_row(item) for item in positions)
+        ) or "<tr><td colspan='8'>当前没有持仓。</td></tr>"
         trade_rows = "\n".join(self._trade_row(item) for item in trades) or "<tr><td colspan='7'>暂时没有已平仓交易。</td></tr>"
         return f"""<!doctype html>
 <html lang="zh-CN">
@@ -130,16 +142,18 @@ class PaperMonitorWriter:
     <h1>策略监控面板</h1>
     <p>生成时间 {html.escape(generated_at)}，页面每 60 秒自动刷新一次。</p>
     <div class="metrics">
-      {self._metric("本轮状态", self._status_span(str(current.get("status") or "missing")))}
-      {self._metric("数据延迟", self._lag_value(current.get("lag_seconds")))}
-      {self._metric("候选数量", str(current.get("candidates") or 0))}
-      {self._metric("本轮订单", str(current.get("orders") or 0))}
-      {self._metric("当前持仓", str(current.get("open_positions") or 0))}
-      {self._metric("当前净值", self._fmt_float(current.get("equity")))}
+      {self._metric("当前净值", self._fmt_float(live.get("live_equity", current.get("equity"))))}
+      {self._metric("累计收益率", self._fmt_pct_plain(live.get("total_return_pct", current.get("return_pct"))))}
+      {self._metric("已实现收益", self._fmt_signed_float(live.get("realized_pnl")))}
+      {self._metric("未实现收益", self._fmt_signed_float(live.get("unrealized_pnl")))}
+      {self._metric("胜率", self._fmt_pct_plain(live.get("win_rate")))}
+      {self._metric("已平仓笔数", str(live.get("closed_trade_count") or 0))}
+      {self._metric("运行时长", self._runtime_value(live.get("runtime_started_at")))}
+      {self._metric("最近成交", self._time_value(live.get("latest_trade_time")))}
     </div>
     <div class="grid">
-      {self._current_cycle_panel(current, latest_run)}
-      {self._last_completed_panel(last_completed, current)}
+      {self._account_panel(current, live)}
+      {self._last_completed_panel(last_completed, current, live)}
     </div>
     <h2 style="margin-top:20px;">当前持仓</h2>
     <table>
@@ -176,23 +190,28 @@ class PaperMonitorWriter:
         {trade_rows}
       </tbody>
     </table>
-    <h2 style="margin-top:20px;">最近运行记录</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Run ID</th>
-          <th>开始时间</th>
-          <th>状态</th>
-          <th>订单</th>
-          <th>候选</th>
-          <th>净值</th>
-          <th>报告</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows}
-      </tbody>
-    </table>
+    <details style="margin-top:20px;">
+      <summary>系统状态</summary>
+      <div class="grid">
+        {self._current_cycle_panel(current, latest_run)}
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Run ID</th>
+            <th>开始时间</th>
+            <th>状态</th>
+            <th>订单</th>
+            <th>候选</th>
+            <th>净值</th>
+            <th>报告</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows}
+        </tbody>
+      </table>
+    </details>
   </main>
 </body>
 </html>
@@ -217,7 +236,18 @@ class PaperMonitorWriter:
         ]
         return self._panel("当前轮次", rows)
 
-    def _last_completed_panel(self, run: RunSummary | None, current: dict[str, Any]) -> str:
+    def _account_panel(self, current: dict[str, Any], live: dict[str, Any]) -> str:
+        rows = [
+            ("现金", self._fmt_float(live.get("cash"))),
+            ("当前持仓数", html.escape(str(live.get("positions_count", current.get("open_positions") or 0)))),
+            ("本轮状态", self._status_span(str(current.get("status") or "missing"))),
+            ("最新成交时间", self._time_value(live.get("latest_trade_time"))),
+            ("数据延迟", self._lag_value(current.get("lag_seconds"))),
+            ("同步错误", html.escape(str(current.get("sync_errors") or 0))),
+        ]
+        return self._panel("账户概览", rows)
+
+    def _last_completed_panel(self, run: RunSummary | None, current: dict[str, Any], live: dict[str, Any]) -> str:
         if run is None:
             return self._panel("最近一次完整运行", [("状态", "缺失")])
         rows = [
@@ -226,6 +256,7 @@ class PaperMonitorWriter:
             ("开始时间", html.escape(run.started_at.isoformat())),
             ("订单", f"{run.orders} ({run.buys} 买 / {run.sells} 卖)"),
             ("净值", "-" if run.equity is None else f"{run.equity:,.2f}"),
+            ("当前实时净值", self._fmt_float(live.get("live_equity"))),
             ("报告是否存在", self._yes_no(run.report_exists)),
             ("报告", self._report_link(run.run_id)),
             ("状态文件", f"<code>{html.escape(str(current.get('state_path') or '-'))}</code>"),
@@ -273,6 +304,25 @@ class PaperMonitorWriter:
             "</tr>"
         )
 
+    def _live_position_row(self, position: dict[str, Any]) -> str:
+        pnl = self._fmt_signed_float(position.get("unrealized_pnl"))
+        ret = self._fmt_pct(position.get("unrealized_return_pct"))
+        risk = str(position.get("stage") or "-")
+        if position.get("stop_hit"):
+            risk = f"{risk} / 触及止损"
+        return (
+            "<tr>"
+            f"<td>{html.escape(str(position.get('symbol') or '-'))}</td>"
+            f"<td>{html.escape(str(position.get('opened_at') or '-'))}</td>"
+            f"<td>{float(position.get('quantity') or 0.0):,.4f}</td>"
+            f"<td>{self._fmt_float(position.get('entry_price'))}</td>"
+            f"<td>{self._fmt_float(position.get('current_price'))}</td>"
+            f"<td>{pnl} {ret}</td>"
+            f"<td>{self._fmt_float(position.get('stop_price'))}</td>"
+            f"<td>{html.escape(risk)}</td>"
+            "</tr>"
+        )
+
     def _trade_row(self, trade: ClosedTradeSummary) -> str:
         return (
             "<tr>"
@@ -312,10 +362,35 @@ class PaperMonitorWriter:
         text = f"{number:+.2%}"
         return f"<span class='{klass}'>{text}</span>" if klass else text
 
+    def _fmt_pct_plain(self, value: Any) -> str:
+        if value is None:
+            return "-"
+        number = float(value)
+        klass = "ok" if number > 0 else "bad" if number < 0 else ""
+        text = f"{number:.2%}"
+        return f"<span class='{klass}'>{text}</span>" if klass else text
+
     def _lag_value(self, value: Any) -> str:
         if value is None:
             return "-"
         return f"{int(value)}s"
+
+    def _runtime_value(self, started_at: Any) -> str:
+        if not started_at:
+            return "-"
+        try:
+            start = ensure_utc(datetime.fromisoformat(str(started_at)))
+        except ValueError:
+            return str(started_at)
+        delta = ensure_utc(datetime.now(UTC)) - start
+        hours = int(delta.total_seconds() // 3600)
+        days, hours = divmod(hours, 24)
+        if days > 0:
+            return f"{days}天 {hours}小时"
+        return f"{hours}小时"
+
+    def _time_value(self, value: Any) -> str:
+        return "-" if not value else html.escape(str(value))
 
     def _freshness_summary(self, current: dict[str, Any]) -> str:
         latest = str(current.get("latest_candle_time") or "-")

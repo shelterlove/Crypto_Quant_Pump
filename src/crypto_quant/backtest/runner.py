@@ -130,6 +130,8 @@ class ResearchBacktester:
     _exit_executor: StrategyExitExecutor = field(init=False)
     _market_engine: MarketContextEngine = field(init=False)
     _candidate_engine: CandidateEngine = field(init=False)
+    _paper_fill_time: datetime | None = None
+    _paper_fill_open_prices: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._persistence = StrategyPersistence(self.config)
@@ -1408,6 +1410,11 @@ class ResearchBacktester:
             self._write_position(session, run_id, next_time, position, "pump_open", order.filled_price)
 
     def _next_open(self, candles: dict[str, pd.DataFrame], symbol: str, next_time: datetime) -> float | None:
+        fill_time = self._paper_fill_time
+        if fill_time is not None and ensure_utc(next_time) == ensure_utc(fill_time):
+            live_price = self._paper_fill_open_prices.get(symbol)
+            if live_price is not None and live_price > 0:
+                return float(live_price)
         frame = candles.get(symbol, pd.DataFrame())
         if frame.empty:
             return None

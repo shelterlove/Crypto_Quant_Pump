@@ -14,6 +14,7 @@ from crypto_quant.backtest.runner import ResearchBacktester
 from crypto_quant.config.settings import load_config
 from crypto_quant.data.sync import CandleSyncService
 from crypto_quant.paper.cycle import PaperCycleDataStale, PaperCycleLocked, PaperCycleRunner
+from crypto_quant.paper.live import PaperLiveStateWriter
 from crypto_quant.paper.monitor import PaperMonitorWriter
 from crypto_quant.paper.runner import PaperRunner
 from crypto_quant.reporting import BacktestReportWriter, RunSummaryBuilder
@@ -215,6 +216,20 @@ def run_paper_cycle(
         f"latest={result.latest_candle_time} expected={result.expected_candle_time} lag_seconds={result.lag_seconds} "
         f"state={result.state_path} report={result.report_path} reason={result.reason}"
     )
+
+
+@paper_app.command("refresh-live")
+def refresh_paper_live(
+    config: Path = Path("configs/main.yaml"),
+    state_path: Path = Path("paper_state/main.json"),
+    out_path: Path = Path("paper_state/live_status.json"),
+    report_dir: Path = Path("reports"),
+) -> None:
+    cfg = load_config(config)
+    session_factory = get_session_factory(cfg.database_url)
+    with session_factory() as session:
+        path = PaperLiveStateWriter(cfg, state_path=state_path, out_path=out_path, report_dir=report_dir).write(session)
+    typer.echo(f"paper live status updated: {path.resolve()}")
 
 
 @paper_app.command("serve-monitor")
